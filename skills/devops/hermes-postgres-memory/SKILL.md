@@ -1,33 +1,393 @@
 ---
 name: hermes-postgres-memory
-description: "Configure, troubleshoot, and harden the PostgreSQL/pgvector memory provider for Hermes Agent — hybrid search, embeddings, non-destructive migration, ownership transfer."
-version: 1.5.0
+description: "Install, configure, troubleshoot, and harden the PostgreSQL/pgvector memory provider for Hermes Agent — onboarding, hybrid search, multi-dim embeddings, non-destructive migration, ownership transfer."
+version: 1.6.0
 author: Shakib Haris
 license: MIT
 platforms: [linux, macos, windows]
 metadata:
   hermes:
-    tags: [hermes-agent, memory, postgres, pgvector, embeddings, troubleshooting, connection-pooling, migration-privileges, ownership-transfer, sidecar-column, cutover]
+    tags: [hermes-agent, memory, postgres, pgvector, embeddings, onboarding, bootstrap, preflight, multi-dim, troubleshooting, connection-pooling, migration-privileges, ownership-transfer, sidecar-column, cutover]
     related_skills: [hermes-agent, hermes-gateway-troubleshooting, systematic-debugging]
 ---
 
-# Hermes Memory Providers
+# Hermes Postgres Memory Provider
 
-## Overview
+A drop-in PostgreSQL + pgvector memory backend for Hermes Agent. Real
+embeddings (Kimi BGE-M3, Ollama nomic-embed-text, or OpenAI), hybrid
+FTS + cosine search, three embedding dims (768 / 1024 / 1536) with
+runtime switching, non-destructive schema migration.
 
-Use this skill when diagnosing or improving Hermes Agent persistent memory providers: built-in memory, provider plugins, provider setup/status commands, and database-backed memory such as PostgreSQL + pgvector.
+This skill has two halves:
 
-Memory provider failures often look like configuration problems, but the true cause can be provider availability, database connection limits, plugin lifecycle behavior, or long-lived gateway/agent processes accumulating connections. Verify, don't vibes-based-debug it like a medieval barber with YAML.
+1. **Onboarding** (top of file) — what to do when the user asks you to
+   install the plugin for the first time, or upgrade an existing
+   1.0/1.1 install. Pre-flight checks, the canonical install path, and
+   the failure modes the bootstrap script handles.
+2. **Operations** (bottom of file) — diagnosing connection problems,
+   tuning connection limits, embedding provider details, migration
+   ownership transfer, the sidecar cutover. Load these when something
+   is already broken.
+
+If you only have time to read one section, read **"Onboarding: first-
+time install"** below. Everything else is reference material.
 
 ## When to Use
 
-- `hermes memory status` reports a provider as installed but unavailable
-- The configured provider is `postgres`, `honcho`, `mem0`, or another memory plugin
-- PostgreSQL returns `too many connections for role ...`
-- Memory works in one runtime but not another, such as CLI vs gateway
-- A memory provider plugin appears to leak or over-retain connections
-- You need to propose safe operational limits for Hermes memory infrastructure
-- You are editing a Hermes memory provider plugin
+- The user says "install the postgres memory plugin" or
+  "switch my memory to postgres" or "use pgvector for memory"
+- The user gives you Postgres connection details and asks you to
+  configure a memory provider
+- `hermes memory status` shows the provider as installed but
+  unavailable
+- `pg_search` returns nothing even though `pg_remember` worked
+- `hermes postgres-memory preflight` reports failures
+- A migration fails with "must be owner of table agent_memory"
+- The user wants to switch between 768 / 1024 / 1536 embedding dims
+- The user wants to A/B test embedding models
+- You're seeing "too many connections for role 'hermes'" in the
+  gateway log
+- The user wants to remove the plugin (use `uninstall.sh`)
+
+## Onboarding: first-time install
+
+This is the canonical 5-step flow. Every first-time install should
+follow this sequence. Each step is a no-op if the prerequisite is
+already in place, so re-running is safe.
+
+### Step 1 — Pre-flight: load this skill + run `diagnose.sh`
+
+Before you install anything, load this skill and run the preflight:
+
+```
+/skill hermes-postgres-memory
+```
+
+The skill is also auto-installed by the bootstrap script into
+`~/.hermes/hermes-agent/skills/devops/hermes-postgres-memory/`, so if
+you haven't loaded it yet, run the bootstrap once first (it will copy
+the skill into place, then you can `/skill` it on the next session).
+
+The `diagnose.sh` script walks every prerequisite the plugin needs.
+Clone the repo and run it:
+
+```bash
+git clone https://github.com/skb50bd/hermes-postgres-memory.git /tmp/hpm
+/tmp/hpm/plugins/memory/postgres/scripts/diagnose.sh
+```
+
+Read the output. It tells you, in plain language, which of these are
+missing:
+
+- [ ] `psql` on `$PATH` (install `postgresql-client`)
+- [ ] A reachable PostgreSQL 13+ server
+- [ ] A database and application role the plugin can use
+      (defaults: `hermes`/`hermes`)
+- [ ] The `vector` (pgvector) extension installed in the target DB
+- [ ] The application role owns the `public` schema
+- [ ] `KIMI_API_KEY` (or another embedder key) in `~/.hermes/.env`
+- [ ] `psycopg2` installed in the python that will run the plugin
+
+**Do not skip this step.** A green diagnose means the bootstrap script
+will succeed end-to-end. A red diagnose tells you exactly which
+prerequisite to fix first.
+
+For a deeper walk-through of each prerequisite (and the rationale for
+why each is needed), see `references/onboarding-checklist.md`. For
+the database-side specifics (extensions, role grants, the password-
+piping caveat for `psql`), see `references/database-bootstrap.md`.
+
+### Step 2 — Ask the user for the details you don't have
+
+The diagnose script can probe what's already configured. The things it
+*can't* probe are the user's secrets. Ask once, upfront, for:
+
+- **Postgres superuser credentials** (host, port, role name, password)
+  — needed once, to create the role + database + extension
+- **Embedder API key** (default: `KIMI_API_KEY` from
+  https://platform.moonshot.cn, free)
+- (Optional) custom database / role names if they don't want the
+  defaults of `hermes` / `hermes`
+
+If the user says "use the same database I already have", ask them to
+confirm:
+
+- The database already has the `vector` extension installed
+- The plugin role has DML on the `agent_memory` table
+  (or the table doesn't exist yet)
+
+If both are yes, the bootstrap script can skip the database creation
+step and just install the schema into the existing database.
+
+### Step 3 — Run `bootstrap.sh`
+
+The bootstrap script is the one command that does everything end-to-
+end. It's idempotent (every SQL uses `IF NOT EXISTS`, every file copy
+is a plain `cp -R`):
+
+```bash
+git clone https://github.com/skb50bd/hermes-postgres-memory.git /tmp/hpm
+cd /tmp/hpm
+./plugins/memory/postgres/scripts/bootstrap.sh
+```
+
+Or non-interactive (for scripted onboarding):
+
+```bash
+export POSTGRES_HOST=10.49.0.33
+export POSTGRES_PORT=5432
+export POSTGRES_SUPERUSER=postgres
+export POSTGRES_SUPERUSER_PASSWORD=*** NEW_DB_NAME=hermes
+export NEW_ROLE_NAME=hermes
+export NEW_ROLE_PASSWORD=***
+....p.sh --non-interactive
+```
+
+What it does, in order:
+
+1. Checks `psql` is installed and the hermes-agent checkout exists
+2. Connects as the postgres superuser (test the connection first,
+   refuse to continue if it fails)
+3. Runs `sql/000_create_database_and_role.sql` — creates the role,
+   the database, the `vector` extension, transfers ownership of the
+   `public` schema
+4. Runs `sql/000_schema.sql` — creates `agent_memory`,
+   `agent_memory_settings`, `agent_memory_models`, `memory_categories`,
+   the HNSW indexes, the FTS index, the per-dim B-tree indexes
+5. Installs the plugin + skill into `~/.hermes/hermes-agent/`
+6. Appends the `POSTGRES_*` block to `~/.hermes/.env` (with
+   `KIMI_API_KEY=` left as a comment for the user to fill in)
+7. Sets `memory.provider: postgres` in `~/.hermes/config.yaml` (if
+   the `memory:` block exists; otherwise leaves a notice)
+8. Re-runs `diagnose.sh` and prints the final report
+
+**If any step fails, the script exits with a clear error.** Read the
+error, fix the underlying problem (the diagnose script will help),
+re-run `bootstrap.sh`. Don't try to fix a half-installed plugin by
+hand.
+
+### Step 4 — User adds the embedder API key + restarts the gateway
+
+The bootstrap script leaves a placeholder in `~/.hermes/.env`:
+
+```bash
+# KIMI_API_KEY=***   # required for the embedder — get one at https://platform.moonshot.cn
+```
+
+**Ask the user** to uncomment that line and paste their key, then
+restart the gateway:
+
+```bash
+hermes gateway restart
+# or, if it's not a managed service:
+pkill -f "hermes gateway" ; hermes gateway run &
+```
+
+The new `.env` and the new plugin only load on a fresh process. If
+the user edited `.env` while the gateway was running, the gateway
+won't see the change until restart.
+
+### Step 5 — Verify + smoke test
+
+```bash
+hermes postgres-memory preflight
+hermes postgres-memory status
+hermes postgres-memory model-list
+```
+
+Expected output:
+
+- `preflight` → every check passes
+- `status` → `default_dim: 1024`,
+  `per_dim_embedded: {768: 0, 1024: 0, 1536: 0}` (zero is correct on
+  a fresh install; the rows have no content yet)
+- `model-list` → 3 rows showing
+  (768/1024/1536) → (provider/model/api-key-env)
+
+Then in a fresh Hermes session (the `pg_remember` / `pg_search` tools
+are session-scoped, so a restart is required to pick them up):
+
+```
+pg_remember(content="postgres plugin is live", category="fact")
+pg_search(query="postgres plugin")
+```
+
+If `pg_search` returns the test memory, you're done. If not, the
+diagnose flow at the bottom of this skill will help.
+
+## Onboarding: upgrading from 1.0 / 1.1
+
+If the user already has the legacy single-`content_vector` schema
+(pre-1.2.0), the bootstrap script will detect the existing
+`agent_memory` table and **refuse to overwrite it**. You have two
+options:
+
+**Option A: sidecar migration (non-destructive, recommended)**
+
+Run the migration set in order:
+
+```bash
+# 0. As superuser — transfer ownership so the hermes role can do DDL
+PGPASSWORD=*** psql -h <host> -U postgres -d hermes \
+  -f ~/.hermes/hermes-agent/plugins/memory/postgres/migrations/000_grant_ddl_to_hermes.sql
+
+# 1-4. As the hermes role — add per-dim columns, indexes, copy legacy data
+for f in 001_add_per_dim_columns.sql 002_hnsw_per_dim.sql 003_migrate_legacy_content_vector.sql; do
+    PGPASSWORD=*** psql -h <host> -U hermes -d hermes \
+      -f ~/.hermes/hermes-agent/plugins/memory/postgres/migrations/$f
+done
+
+# 5. (later) backfill the other dims
+hermes postgres-memory backfill
+
+# 6. (later, irreversible) drop the legacy column
+hermes postgres-memory finalize-cutover --yes
+```
+
+The plugin auto-detects the legacy column and uses it for searches
+until `finalize-cutover --yes` runs. See `references/migration-
+privileges.md` for why the ownership transfer is mandatory (and why
+no `GRANT` will fix it).
+
+**Option B: nuke and re-seed (destructive, only for fresh installs)**
+
+If the user is OK losing all stored memories (e.g. they're testing
+in a throwaway DB), drop the existing schema first and let the
+bootstrap script start clean:
+
+```bash
+plugins/memory/postgres/scripts/uninstall.sh --db --yes
+plugins/memory/postgres/scripts/bootstrap.sh
+```
+
+## Onboarding: uninstall
+
+The `uninstall.sh` script is the inverse of `bootstrap.sh`. It has
+three modes:
+
+```bash
+# Remove the plugin + skill files only (DB untouched)
+plugins/memory/postgres/scripts/uninstall.sh --plugin
+
+# Drop the agent_memory schema from the DB
+plugins/memory/postgres/scripts/uninstall.sh --db --yes
+
+# Both, plus clean up .env entries
+plugins/memory/postgres/scripts/uninstall.sh --all --yes
+
+# Nuclear: also drop the role and database
+plugins/memory/postgres/scripts/uninstall.sh --all --role --database --yes
+```
+
+Each destructive step asks for confirmation by default. `--yes` skips
+the prompts. The script does **not** remove the `vector` extension
+by default — that's a server-wide change, do it by hand only after
+every plugin table is gone.
+
+## For the agent: pre-validation workflow
+
+When the user says "install the postgres memory plugin", follow this
+sequence **before touching any files**:
+
+```bash
+# 1. Pre-flight: what's already there?
+git clone https://github.com/skb50bd/hermes-postgres-memory.git /tmp/hpm
+/tmp/hpm/plugins/memory/postgres/scripts/diagnose.sh
+
+# 2. Read the output. For every FAIL, ask the user the
+#    matching question from references/onboarding-checklist.md.
+#    Do NOT proceed until diagnose shows zero failures.
+```
+
+If the user already has a hermes-agent install and just wants the
+plugin added, and the diagnose is green, the full sequence is:
+
+```bash
+# 3. Run the bootstrap (interactive — asks for superuser pw)
+...p.sh
+
+# 4. User adds KIMI_API_KEY to ~/.hermes/.env
+
+# 5. User restarts the gateway
+hermes gateway restart
+
+# 6. Verify
+hermes postgres-memory preflight
+hermes postgres-memory status
+
+# 7. Smoke test in a fresh session
+pg_remember(content="postgres plugin is live", category="fact")
+pg_search(query="postgres plugin")
+```
+
+If the user has an existing 1.0/1.1 install (single `content_vector`
+column), use the sidecar migration flow above instead of the fresh-
+install bootstrap.
+
+If the user has a different memory plugin installed (honcho, mem0,
+retaindb, etc.), the bootstrap will detect the `memory.provider` is
+not `postgres` and will offer to switch it. The other plugin stays
+installed but is unused.
+
+## For the agent: what to tell the user upfront
+
+Before you run any commands, give the user a one-screen summary so
+they know what's about to happen. Suggested text:
+
+> I'm going to install the postgres memory provider. The setup will:
+> 1. Create a database (`hermes`) and a role (`hermes`) on your
+>    Postgres server — I need the postgres superuser password for
+>    this.
+> 2. Install the `pgvector` extension in that database.
+> 3. Install the plugin and create the `agent_memory` schema.
+> 4. Add the `POSTGRES_*` env vars to `~/.hermes/.env`.
+> 5. Set `memory.provider: postgres` in `~/.hermes/config.yaml`.
+>
+> I'll need you to add a `KIMI_API_KEY` (free, get one at
+> https://platform.moonshot.cn) and restart the gateway after I'm
+> done. Total time: ~2 minutes if Postgres is already up.
+
+If the user balks at the superuser requirement, point out that it's
+one-time — the plugin never needs DDL after the initial install, and
+you can `ALTER TABLE ... OWNER TO postgres;` afterward to downscope
+the role back to DML-only.
+
+## Reference: full onboarding docs
+
+The repo ships with extensive onboarding documentation the agent can
+load when needed:
+
+- `references/onboarding-checklist.md` — the canonical pre-flight
+  checklist, with one-liner probes for every prerequisite
+- `references/database-bootstrap.md` — what the database needs, why
+  each requirement exists, the password-piping caveat for `psql`,
+  the GUCs the SQL script accepts
+- `references/migration-privileges.md` — the ownership-transfer
+  rationale, the SQL pattern, the security tradeoffs
+- `references/pgvector-connectivity-probe.md` — the gold-standard
+  direct psycopg2 probe for connection debugging
+- `bootstrap-message.txt` — the full copy-pasteable instruction
+  manual to send to another agent instance
+- `bootstrap-message-short.txt` — the 5-command TL;DR for users who
+  just want it done
+- `plugins/memory/postgres/scripts/diagnose.sh` — the preflight
+  script (re-runnable, JSON output for automation)
+- `plugins/memory/postgres/scripts/bootstrap.sh` — the one-shot
+  installer
+- `plugins/memory/postgres/scripts/uninstall.sh` — the inverse
+- `plugins/memory/postgres/sql/000_create_database_and_role.sql` —
+  the only file that requires superuser privileges
+- `plugins/memory/postgres/sql/000_schema.sql` — the plugin's own
+  schema (idempotent)
+
+---
+
+# Operations: diagnostics + troubleshooting
+
+The rest of this skill covers operations and troubleshooting. Load
+this half when the plugin is already installed but something is
+broken, or when the user is asking operational questions (connection
+limits, embedding provider selection, dim migration).
 
 ## Diagnostic Flow
 
@@ -38,7 +398,9 @@ Memory provider failures often look like configuration problems, but the true ca
    hermes config path
    hermes config env-path
    ```
-3. Verify runtime environment separately from CLI status output. **Important**: `os.environ` may be stale from startup — if the user updated `.env` mid-session, re-read it directly (see step 5 probe).
+3. Verify runtime environment separately from CLI status output.
+   **Important**: `os.environ` may be stale from startup — if the user
+   updated `.env` mid-session, re-read it directly (see step 5 probe).
    ```bash
    for v in POSTGRES_HOST POSTGRES_PORT POSTGRES_USER POSTGRES_PASSWORD POSTGRES_DATABASE; do
      [ -n "${!v}" ] && echo "$v=set" || echo "$v=unset"
@@ -48,7 +410,11 @@ Memory provider failures often look like configuration problems, but the true ca
    ```bash
    pg_isready -h "$POSTGRES_HOST" -p "$POSTGRES_PORT" -U "$POSTGRES_USER" -d "$POSTGRES_DATABASE"
    ```
-5. **The gold-standard probe**: `hermes memory status` can report "available ✓" on a dead connection, and it can also miss post-restore permission gaps (its `is_available()` check queries only catalog tables, not `agent_memory` directly). Always run the direct psycopg2 probe that re-reads `.env` directly and checks permissions — see `references/pgvector-connectivity-probe.md`.
+5. **The gold-standard probe**: `hermes memory status` can report
+   "available ✓" on a dead connection, and it can also miss post-
+   restore permission gaps. Always run the direct psycopg2 probe
+   that re-reads `.env` directly and checks permissions — see
+   `references/pgvector-connectivity-probe.md`.
 6. Check Postgres role/database connection usage:
    ```sql
    SELECT usename, state, count(*)
@@ -56,7 +422,9 @@ Memory provider failures often look like configuration problems, but the true ca
    WHERE usename = 'hermes'
    GROUP BY usename, state;
    ```
-7. Inspect provider plugin lifecycle: persistent connection per provider instance, per-process pools, shutdown hooks, retry paths, and availability checks.
+7. Inspect provider plugin lifecycle: persistent connection per
+   provider instance, per-process pools, shutdown hooks, retry paths,
+   and availability checks.
 
 ## PostgreSQL Role Connection Limits
 

@@ -9,68 +9,40 @@ you switch between them at runtime via `hermes postgres-memory model-set`.
 
 ---
 
-## Quick start (5 minutes)
+## 🚀 First-time install (5 minutes)
 
-### 1. Prerequisites
-- PostgreSQL 13+ with the `pgvector` extension (`apt install postgresql-15-pgvector` or the equivalent for your distro)
-- A free API key — Kimi (`KIMI_API_KEY` from https://platform.moonshot.cn) is the default for 1024-dim BGE-M3
-- For 768-dim: a local Ollama install with `ollama pull nomic-embed-text` running on `localhost:11434`
-- For 1536-dim (OpenAI text-embedding-3-small): an `OPENAI_API_KEY`
+The one-shot installer handles everything: creates the database + role +
+pgvector extension, installs the plugin + skill, configures `.env` and
+`config.yaml`, runs the preflight. **Idempotent. Re-run any time.**
 
-### 2. Create the schema (run once)
 ```bash
-PGPASSWORD="..." psql -h 10.49.0.33 -U hermes -d hermes \
-  -f plugins/memory/postgres/sql/000_schema.sql
+git clone https://github.com/skb50bd/hermes-postgres-memory.git /tmp/hpm
+cd /tmp/hpm
+./plugins/memory/postgres/scripts/bootstrap.sh
 ```
 
-This creates:
-- `agent_memory` table with **three vector columns** (vector_768, vector_1024, vector_1536) all nullable, all HNSW-indexed
-- `memory_categories` (8 fixed categories)
-- `agent_memory_settings` (one row per config key, holds `default_dim`)
-- `agent_memory_models` (per-dim model registry, pre-populated with sensible defaults)
-- All secondary indexes (FTS, target, category, tags, metadata, active)
+It will ask you for:
+- Your **Postgres superuser** password (one-time, to create the role + DB)
+- A password for the new `hermes` role (the plugin authenticates as this)
 
-### 3. Install the plugin
+After it finishes, edit `~/.hermes/.env` to uncomment `KIMI_API_KEY=*** and
+add your key (free at https://platform.moonshot.cn), then restart the
+gateway:
+
 ```bash
-cd ~/repos/hermes-postgres-memory
-./install.sh
+hermes gateway restart
 ```
 
-Or manually:
+**If something fails** before any side effects, run the preflight:
+
 ```bash
-cp -r plugins/memory/postgres/ ~/.hermes/hermes-agent/plugins/memory/
+./plugins/memory/postgres/scripts/diagnose.sh
 ```
 
-### 4. Configure
-Add to `~/.hermes/.env`:
-```bash
-POSTGRES_HOST=10.49.0.33
-POSTGRES_PORT=5432
-POSTGRES_USER=hermes
-POSTGRES_PASSWORD=your_d...n
-# Embedder — defaults are kimi, free, 1024-dim. Override only if you want.
-KIMI_API_KEY=sk-...
-# Optional: per-dim overrides
-# HERMES_EMBED_PROVIDER_768=ollama_local
-# HERMES_EMBED_MODEL_768=nomic-embed-text
-# OLLAMA_API_KEY=         # only if ollama_cloud
-# HERMES_EMBED_PROVIDER_1536=openai
-# HERMES_EMBED_MODEL_1536=text-embedding-3-small
-# OPENAI_API_KEY=sk-...
-```
-
-### 5. Verify
-```bash
-hermes postgres-memory status
-hermes postgres-memory model-list
-hermes postgres-memory preflight
-```
-
-### 6. Use the plugin
-Restart Hermes Agent. The memory provider will:
-- Read `default_dim` from `agent_memory_settings` (default: 1024)
-- Embed every `pg_remember` at that dim, write to the matching per-dim column
-- Hybrid-search the matching column on every `pg_search`
+It walks 16 prerequisites and tells you, in plain language, which are
+missing. For the 5-command TL;DR see
+[`bootstrap-message-short.txt`](bootstrap-message-short.txt). For the
+full walkthrough, see [`bootstrap-message.txt`](bootstrap-message.txt).
 
 ---
 
@@ -248,6 +220,23 @@ hermes postgres-memory preflight
 hermes postgres-memory finalize-cutover --yes
 hermes postgres-memory vector-column --set v1|v2       # DEPRECATED, mapped to --dim 1536/1024
 ```
+
+## Helper scripts
+
+The repo ships three first-class installer / uninstaller / preflight
+scripts. They live under `plugins/memory/postgres/scripts/`:
+
+| Script | What it does |
+|---|---|
+| `bootstrap.sh` | One-shot installer. Asks for the superuser password, creates the database + role + pgvector extension, installs the schema, copies plugin + skill files, patches `.env` and `config.yaml`, runs the preflight. Interactive by default, `--non-interactive` for scripted deploys. |
+| `diagnose.sh` | Preflight checker. Walks 16 prerequisites (hermes-agent checkout, `.env`, psql on PATH, pgvector, role, schema, indexes, etc.) and prints a pass/fail table. Re-runnable. `--json` for automation. |
+| `uninstall.sh` | Inverse of `bootstrap.sh`. Three modes: `--plugin` (files only), `--db` (drop tables), `--all` (both). Plus `--role` and `--database` to drop the role and DB. Asks before each destructive step. |
+
+The database creation SQL that the bootstrap script invokes lives at
+`plugins/memory/postgres/sql/000_create_database_and_role.sql`. It is
+the **only** file in the plugin that requires superuser privileges, and
+it accepts GUCs (`-v dbname=...`, `-v rolename=...`, `-v pw=...`) so
+everything is customizable.
 
 ---
 

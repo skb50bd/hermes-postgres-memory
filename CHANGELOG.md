@@ -1,5 +1,60 @@
 # Changelog
 
+## 1.3.0 (2026-06-XX)
+
+### Major changes
+- **One-shot installer**: `plugins/memory/postgres/scripts/bootstrap.sh`
+  walks the entire first-time install end-to-end. Interactive by default,
+  `--non-interactive` for scripted deploys. Handles: psql availability,
+  psycopg2 install, hermes-agent checkout detection, superuser connection
+  test, role + database + extension creation, schema install, .env
+  patching, config.yaml patching, plugin + skill file copy, final
+  preflight. Idempotent.
+- **Preflight checker**: `plugins/memory/postgres/scripts/diagnose.sh`
+  walks 16 prerequisites and prints a pass/fail table. Re-runnable.
+  `--json` for automation. Used internally by `bootstrap.sh` and
+  `install.sh` to refuse to proceed on a broken environment.
+- **Clean uninstaller**: `plugins/memory/postgres/scripts/uninstall.sh`
+  is the inverse of `bootstrap.sh`. Modes: `--plugin` (files only),
+  `--db` (drop tables), `--all` (both), plus `--role` and `--database`.
+  Asks before each destructive step.
+- **First-class database bootstrap SQL**:
+  `sql/000_create_database_and_role.sql` is the **only** file in the
+  plugin that requires superuser privileges. Creates the role, the
+  database, the `vector` extension, transfers ownership of the `public`
+  schema to the new role. Accepts GUCs (`-v dbname=`, `-v rolename=`,
+  `-v pw=`, `-v connlimit=`, `-v allow_weak_pw=`) so everything is
+  customizable. Idempotent.
+- **Onboarding-first skill**: `skills/devops/hermes-postgres-memory/SKILL.md`
+  v1.6.0 — onboarding is now the first half of the skill, with a
+  canonical 5-step flow, a pre-validation workflow, a "what to tell the
+  user upfront" template, and explicit failure modes. Diagnostics
+  moved to the second half.
+- **Two new reference docs**:
+  - `references/onboarding-checklist.md` — the canonical pre-flight
+    checklist, with one-liner probes for every prerequisite
+  - `references/database-bootstrap.md` — what the database needs, why
+    each requirement exists, the password-piping caveat for `psql`,
+    the GUCs the SQL script accepts
+- **Bootstrap messages**: `bootstrap-message.txt` (full walkthrough
+  for sending to another agent instance) and `bootstrap-message-short.txt`
+  (the 5-command TL;DR).
+
+### install.sh
+- Now runs `diagnose.sh` as a preflight by default; refuses to install
+  if any check fails (use `--yes` to override). Also supports
+  `--diagnose` to run the preflight without installing.
+- Print a clear "next steps" panel at the end pointing at
+  `bootstrap.sh` for first-time installs.
+
+### Live verification
+- Run the new `diagnose.sh` against a freshly-1.2.0'd live DB:
+  16/17 pass; the one failure (`public schema owner = pg_database_owner`)
+  is a real pre-existing finding — the schema is unowned. The diagnose
+  correctly reports it and tells the user the fix:
+  `ALTER SCHEMA public OWNER TO hermes;`
+  (run as superuser). Tracked as a follow-up.
+
 ## 1.2.0 (2026-06-XX)
 
 ### Major changes

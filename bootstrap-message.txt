@@ -1,0 +1,260 @@
+# 🤖 → 🤖: swap your memory plugin to PostgreSQL + pgvector
+
+You are a Hermes Agent instance. Your user has asked you to switch your
+memory backend from the default provider to my PostgreSQL + pgvector
+plugin. It supports 3 embedding dims (768 / 1024 / 1536) and is fully
+self-hosted. Free, MIT-licensed, owned by Shakib Haris.
+
+Repo: **https://github.com/skb50bd/hermes-postgres-memory**
+
+> **If you have already installed the plugin and just need a 5-command
+> TL;DR**, see `bootstrap-message-short.txt` in the same repo. The rest
+> of this document is the full walkthrough, with the failure modes
+> called out.
+
+---
+
+## Step 0 — Load the skill
+
+Before you start, load the `hermes-postgres-memory` skill. It has the
+canonical preflight + onboarding flow and saves you from re-discovering
+the gotchas:
+
+```
+/skill hermes-postgres-memory
+```
+
+(If the skill isn't installed yet, run the bootstrap script first —
+it copies the skill into `~/.hermes/hermes-agent/skills/`.)
+
+## Step 1 — Sanity check
+
+Confirm you are a Hermes Agent install and you have a working
+`~/.hermes/hermes-agent/` checkout:
+
+```bash
+test -d ~/.hermes/hermes-agent/plugins/memory && echo OK || echo "not a hermes-agent checkout"
+```
+
+If `not a hermes-agent checkout`, stop and ask the user where the
+checkout lives, then `export HERMES_HOME=/that/path` for the rest
+of the steps.
+
+## Step 2 — Run the diagnose script (preflight)
+
+The repo ships a `diagnose.sh` that walks every prerequisite the plugin
+needs. Run it before you install anything:
+
+```bash
+git clone https://github.com/skb50bd/hermes-postgres-memory.git /tmp/hpm
+/tmp/hpm/plugins/memory/postgres/scripts/diagnose.sh
+```
+
+Read the output. It tells you exactly which of these are missing:
+
+- [ ] `psql` on `$PATH` (install `postgresql-client`)
+- [ ] A reachable PostgreSQL 13+ server with the `pgvector` extension
+- [ ] A database and application role the plugin can use (defaults:
+      `hermes`/`hermes`, both overridable)
+- [ ] `KIMI_API_KEY` (or another embedder key) in `~/.hermes/.env`
+- [ ] `psycopg2` installed in the python that will run the plugin
+
+**Do NOT skip this step.** If the diagnose reports failures, fixing
+them first saves you from a half-installed plugin.
+
+## Step 3 — Ask the user for the database details
+
+If the user hasn't already given you a connection string, ask. You need:
+
+- **Superuser credentials** (one-time, to create the role + database)
+  - Host, port, role name (usually `postgres`), password
+- **Embedder API key**
+  - `KIMI_API_KEY` is the free default (https://platform.moonshot.cn)
+  - Alternatives: `OLLAMA_API_KEY` (768-dim, local), `OPENAI_API_KEY`
+    (1536-dim, paid)
+
+> **Do not ask for the new role's password — the bootstrap script
+> generates one interactively (or you pass `NEW_ROLE_PASSWORD` in
+> non-interactive mode).**
+
+## Step 4 — Run the bootstrap script
+
+This is the one command that does everything:
+
+```bash
+git clone https://github.com/skb50bd/hermes-postgres-memory.git /tmp/hpm
+cd /tmp/hpm
+./plugins/memory/postgres/scripts/bootstrap.sh
+```
+
+Or non-interactive, for scripted onboarding:
+
+```bash
+export POSTGRES_HOST=10.49.0.33
+export POSTGRES_PORT=5432
+export POSTGRES_SUPERUSER=postgres
+export POSTGRES_SUPERUSER_PASSWORD=***
+export NEW_DB_NAME=hermes
+export NEW_ROLE_NAME=hermes
+export NEW_ROLE_PASSWORD=***
+./plugins/memory/postgres/scripts/bootstrap.sh --non-interactive
+```
+
+The script will:
+
+1. Check `psql` is installed and the hermes-agent checkout exists
+2. Connect as the postgres superuser and create the role + database
+3. Install the `pgvector` extension
+4. Run the plugin's `000_schema.sql` to create `agent_memory` etc.
+5. Install the plugin + skill into `~/.hermes/hermes-agent/`
+6. Append the `POSTGRES_*` block to `~/.hermes/.env`
+7. Set `memory.provider: postgres` in `~/.hermes/config.yaml`
+8. Run the diagnose script and print the final report
+
+If any step fails, the script exits with a clear error. **Re-running is
+safe** — every SQL statement uses `IF NOT EXISTS` and the file copy is
+a plain `cp -R`.
+
+## Step 5 — Add the embedder API key to .env
+
+The bootstrap script leaves a placeholder in `~/.hermes/.env`:
+
+```bash
+# KIMI_API_KEY=***   # required for the embedder — get one at https://platform.moonshot.cn
+```
+
+**Ask the user** to uncomment that line and paste their key, then save.
+
+If they don't have a Kimi key, alternatives:
+- Local Ollama (free, 768-dim): install Ollama, run `ollama pull
+  nomic-embed-text`, set `HERMES_EMBED_PROVIDER_768=ollama_local`
+- OpenAI (paid, 1536-dim): `OPENAI_API_KEY=sk-...` and
+  `hermes postgres-memory model-set --dim 1536 --provider openai --model
+  text-embedding-3-small --api-key-env OPENAI_API_KEY`
+
+## Step 6 — Restart the gateway
+
+The new `.env` and the new plugin only load on a fresh process. Restart:
+
+```bash
+hermes gateway restart
+# or, if it's not a managed service:
+pkill -f "hermes gateway" ; hermes gateway run &
+```
+
+## Step 7 — Verify
+
+```bash
+hermes postgres-memory preflight
+hermes postgres-memory status
+hermes postgres-memory model-list
+```
+
+Expected output:
+
+- `preflight` → every check passes
+- `status` → `default_dim: 1024`, `per_dim_embedded: {768: 0, 1024: 0, 1536: 0}`
+  (zero is correct on a fresh install; the rows have no content yet)
+- `model-list` → 3 rows showing (768/1024/1536) → (provider/model/api-key-env)
+
+## Step 8 — Smoke test
+
+In a fresh Hermes session (the `pg_remember` / `pg_search` tools are
+session-scoped, so a restart is required to pick them up):
+
+```
+pg_remember(content="postgres plugin is live", category="fact")
+pg_search(query="postgres plugin")
+```
+
+You should get the test memory back. If `pg_search` returns nothing:
+
+1. Run `hermes postgres-memory status` — check
+   `per_dim_embedded.<default_dim>`. If it's `0` after the smoke test,
+   the embedder is failing silently.
+2. Check `KIMI_API_KEY` is in the running gateway's env. The gateway
+   reads `.env` at startup, not on every call — if you edited `.env`
+   after starting it, you must restart.
+3. Try `HERMES_EMBED_FAIL_OPEN=0 hermes postgres-memory preflight` to
+   make embedder errors surface instead of degrading to zero vectors.
+
+## Step 9 — Backfill (optional, for switching dims later)
+
+The default is 1024-dim. If the user later wants to A/B test models
+or migrate to a different dim, they can:
+
+```bash
+hermes postgres-memory backfill              # all dims
+hermes postgres-memory backfill --dim 768    # just 768
+```
+
+The backfill script reads existing `content` text, embeds it at the
+target dim, and writes the vector to the matching column. Idempotent —
+already-populated cells are skipped. You can run it on a cron if you
+want to keep all three dims warm.
+
+## Switching dims at runtime
+
+```bash
+hermes postgres-memory model-set --dim 768
+hermes postgres-memory model-set --dim 1024
+hermes postgres-memory model-set --dim 1536
+```
+
+This updates `agent_memory_settings.default_dim`. The next `pg_remember`
+embeds at the new dim and writes to the new column. `pg_search` reads
+the new column. Old rows that already have the new dim are immediately
+queryable.
+
+## Upgrading from 1.0 / 1.1 (sidecar pattern)
+
+If you already have the legacy single `content_vector` column (pre-1.2.0
+schema), the bootstrap script will detect the existing `agent_memory`
+table and refuse to run `000_schema.sql` against it. **Do not** edit the
+schema by hand. Instead, run the migrations in order from
+`migrations/000_grant_ddl_to_hermes.sql` through `004_drop_legacy_column.sql`.
+The README has the full sequence. The `hermes-postgres-memory` skill
+has a reference doc explaining the privilege dance.
+
+## When something breaks
+
+| Symptom | Fix |
+|---|---|
+| `diagnose.sh` says "psql not found" | Install `postgresql-client` |
+| `diagnose.sh` says "POSTGRES_* unset" | Edit `~/.hermes/.env` (the bootstrap script appends a block — verify it's there) |
+| `diagnose.sh` says "pgvector not installed" | The `000_create_database_and_role.sql` script installs it. Re-run that script as superuser, or `apt install postgresql-15-pgvector` and re-run. |
+| `diagnose.sh` says "public schema owned by postgres" | `ALTER SCHEMA public OWNER TO $POSTGRES_USER;` as superuser |
+| `bootstrap.sh` says "could not connect as postgres" | Wrong password, wrong port, or wrong host. Re-run with the correct superuser credentials. |
+| `hermes postgres-memory status` shows `per_dim_embedded` all 0 after a smoke test | Embedder is failing silently. Check `KIMI_API_KEY` is in the gateway's env. Try `HERMES_EMBED_FAIL_OPEN=0` to surface errors. |
+| `pg_search` returns nothing | The row may not have a vector at the configured dim yet. Backfill or switch dims with `model-set`. |
+| `hermes memory status` says the plugin is unavailable | Restart the gateway. The plugin is registered on import, not at config-parse time. |
+| `psql: error: could not open extension control file ".../vector.control"` | The pgvector **OS package** is missing. Install `postgresql-XX-pgvector` for your Postgres major version, then re-run the bootstrap script. |
+| "must be owner of table agent_memory" | Run `migrations/000_grant_ddl_to_hermes.sql` as superuser. The plugin owns the table after that, and can do all DDL itself. |
+
+## Files you'll touch
+
+- `~/.hermes/.env` — add `POSTGRES_*` and `KIMI_API_KEY` (bootstrap does this)
+- `~/.hermes/config.yaml` — set `memory.provider: postgres` (bootstrap does this)
+- `~/.hermes/hermes-agent/plugins/memory/postgres/` — plugin code
+- `~/.hermes/hermes-agent/skills/devops/hermes-postgres-memory/` — skill
+- DB tables: `agent_memory`, `agent_memory_settings`, `agent_memory_models`, `memory_categories`
+
+## What you get
+
+- `pg_remember` / `pg_search` / `pg_recent` / `pg_forget` / `pg_status` tools
+- `hermes postgres-memory {status, model-list, model-set, backfill, preflight, finalize-cutover}` CLI
+- 3 embedder dims with runtime switching, zero data loss
+- Hybrid search (FTS + cosine) with per-row dim routing
+- TTL, soft delete, categories, tags, JSONB metadata
+- On-disk embedding cache so re-embedding the same text is free
+
+🎉
+
+---
+
+> **For the agent reading this**: if anything in this document is
+> wrong or missing, file an issue at
+> https://github.com/skb50bd/hermes-postgres-memory/issues. The
+> bootstrap script and diagnose script are the canonical entry
+> points; this message is a fallback for users who want to do it by
+> hand.

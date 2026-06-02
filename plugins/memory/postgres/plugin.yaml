@@ -1,0 +1,16 @@
+name: postgres
+version: 1.1.0
+description: "PostgreSQL + pgvector memory — HNSW semantic search, full-text search, hybrid retrieval, categories, tags, TTL, soft deletes. Non-destructive sidecar-column migration with pluggable embedders (kimi free default, ollama_local, noop)."
+author: "Shakib Haris"
+license: "MIT"
+pip_dependencies:
+  - httpx
+requires_env:
+  - POSTGRES_HOST
+  - POSTGRES_PORT
+  - POSTGRES_USER
+  - POSTGRES_PASSWORD
+  - POSTGRES_DATABASE
+  - HERMES_EMBED_PROVIDER
+hooks:
+  - on_session_end

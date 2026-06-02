@@ -1,13 +1,16 @@
 """Integration tests for the embedding hooks in the PostgreSQL memory plugin.
 
 Verifies that:
-- add_memory() embeds the content via the embedder (no real network).
-- search_memories() embeds the query and runs a hybrid query that
-  combines ts_rank and cosine distance.
-- The plugin still works when the embedder fails open to a zero vector
-  (degraded mode, but does not raise).
-- The search SQL parameter list has the same length as the placeholder
-  count in the SQL (placeholder/param drift guard).
+- add_memory() embeds the content at the default dim and persists the
+  vector in the matching per-dim column.
+- search_memories() embeds the query at the (optional) dim and runs
+  a hybrid query that combines ts_rank and cosine distance.
+- The plugin still works when the embedder fails open to a zero
+  vector (degraded mode, but does not raise).
+- The search SQL parameter list has the same length as the
+  placeholder count (placeholder/param drift guard).
+- model-set tooling writes the agent_memory_settings.default_dim row
+  and rebuilds the embedder on next access.
 """
 
 from __future__ import annotations
@@ -24,13 +27,12 @@ import psycopg2.pool
 import pytest
 
 
-# Centralized dim for all tests in this file. The shipped schema is
-# vector(1024) (BGE-M3 family); tests that hardcode a different dim
-# are a bug.
-EMBED_DIM = 1024
+# Per-dim constants.
+EMBED_DIM_768 = 768
+EMBED_DIM_1024 = 1024
+EMBED_DIM_1536 = 1536
 
-# Add the plugin dir to sys.path so we can `import embedder` (the new
-# flat layout) and `import __init__` (the plugin module).
+# Add the plugin dir to sys.path.
 PLUGIN_DIR = os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..", "plugins", "memory", "postgres")
 )
@@ -39,15 +41,9 @@ if PLUGIN_DIR not in sys.path:
 
 
 @pytest.fixture()
-def pg_module(monkeypatch):
-    """Fresh import of the postgres plugin per test.
-
-    The plugin's __init__.py imports `agent.memory_provider` and
-    `tools.registry` from the host hermes-agent. We shim those with
-    fake modules so the test can import the plugin without a real
-    hermes-agent install.
-    """
-    # Provide shims for the hermes-agent imports the plugin needs.
+def pg_module(monkeypatch, tmp_path_factory):
+    """Fresh import of the postgres plugin per test, with shims for the
+    hermes-agent imports the plugin needs."""
     if "agent.memory_provider" not in sys.modules:
         class _MemoryProvider:
             def __init__(self, *a, **kw): pass
@@ -70,15 +66,23 @@ def pg_module(monkeypatch):
     monkeypatch.setenv("POSTGRES_USER", "hermes")
     monkeypatch.setenv("POSTGRES_PASSWORD", "secret")
     monkeypatch.setenv("POSTGRES_DATABASE", "hermes")
-    monkeypatch.setenv("HERMES_EMBED_PROVIDER", "ollama_cloud")
-    monkeypatch.setenv("HERMES_EMBED_API_KEY", "fake")
-    monkeypatch.setenv("HERMES_EMBED_CACHE", "0")
+    monkeypatch.setenv("HERMES_EMBED_PROVIDER_768", "ollama_local")
+    monkeypatch.setenv("HERMES_EMBED_PROVIDER_1024", "kimi")
+    monkeypatch.setenv("HERMES_EMBED_PROVIDER_1536", "kimi")
+    monkeypatch.setenv("HERMES_EMBED_API_KEY_1024", "fake")
+    monkeypatch.setenv("HERMES_EMBED_API_KEY_1536", "fake")
+    monkeypatch.setenv("HERMES_EMBED_CACHE_768", "0")
+    monkeypatch.setenv("HERMES_EMBED_CACHE_1024", "0")
+    monkeypatch.setenv("HERMES_EMBED_CACHE_1536", "0")
+    # Use a per-test cache dir so the user's real cache doesn't
+    # bleed into tests. We point all 3 dims at the same dir.
+    cache_dir = str(tmp_path_factory.mktemp("embed_cache"))
+    for d in (768, 1024, 1536):
+        monkeypatch.setenv(f"HERMES_EMBED_CACHE_DIR_{d}", cache_dir)
+        monkeypatch.setenv("HERMES_EMBED_CACHE_DIR", cache_dir)
 
     import embedder as em
     em.reset_embedder()
-    # Load the plugin module by file path (it has no subpackage prefix
-    # in the new flat layout, but its filename is `__init__.py` so we
-    # use importlib.util).
     import importlib.util
     init_path = os.path.join(PLUGIN_DIR, "__init__.py")
     spec = importlib.util.spec_from_file_location("pg_plugin", init_path)
@@ -96,12 +100,9 @@ class FakeCursor:
         self.connection = connection
         self._rows = []
         self._row_idx = 0
-        self._description = None
         self._last_sql = ""
         self._last_params = None
-        # All execute() calls (sql, params) in order. Useful when the
-        # same cursor issues multiple SQLs (e.g. v2 then v1 fallback).
-        self.executions = []
+        self.executions = []  # all (sql, params) in order
         self.closed = False
         self.rowcount = 0
 
@@ -118,8 +119,6 @@ class FakeCursor:
         elif "SELECT id FROM memory_categories" in sql:
             self._rows = [(1,)]
         elif "WITH fts_candidates" in sql or "ts_rank" in sql and "FROM agent_memory" in sql:
-            # Simulate a hybrid result set. Reset the row pointer so
-            # the next fetchone() starts at 0.
             from datetime import datetime, timezone
             self._rows = [
                 ("uuid-1", "memory", "alpha content", datetime.now(timezone.utc),
@@ -147,28 +146,22 @@ class FakeCursor:
             self._rows = [("fact", 2)]
             self._row_idx = 0
         elif "agent_memory_settings" in sql:
-            # The plugin's _read_live_column query. Pretend it's never
-            # set so the plugin falls through to v1.
+            # The plugin's _read_default_dim query. Pretend it's never
+            # set so the plugin falls through to the env-var default.
             self._rows = []
             self._row_idx = 0
         else:
             self._rows = []
             self._row_idx = 0
 
-    def fetchall(self):
-        return self._rows
-
+    def fetchall(self): return self._rows
     def fetchone(self):
-        if not self._rows:
-            return None
-        if self._row_idx >= len(self._rows):
+        if not self._rows or self._row_idx >= len(self._rows):
             return None
         row = self._rows[self._row_idx]
         self._row_idx += 1
         return row
-
-    def close(self):
-        self.closed = True
+    def close(self): self.closed = True
 
 
 class FakeConnection:
@@ -176,7 +169,6 @@ class FakeConnection:
         self._cur = None
         self.autocommit = False
         self.cursors = []
-
     def cursor(self):
         self._cur = FakeCursor(connection=self)
         self.cursors.append(self._cur)
@@ -188,11 +180,9 @@ class FakePool:
         self.conn = FakeConnection()
         self.getconn_calls = 0
         self.putconn_calls = 0
-
     def getconn(self):
         self.getconn_calls += 1
         return self.conn
-
     def putconn(self, conn, close=False):
         self.putconn_calls += 1
 
@@ -204,106 +194,219 @@ def fake_pool(monkeypatch):
     return pool
 
 
-def test_add_memory_calls_embedder_and_persists_vector(pg_module, fake_pool, monkeypatch):
+def test_add_memory_writes_to_default_dim_column(pg_module, fake_pool, monkeypatch):
+    """A 1024-dim default inserts into vector_1024 (the matching column)."""
+    # Stub the SQL model-config reader so the embedder factory doesn't
+    # try to connect to a real DB. Return a kimi/1024 config with a
+    # fake key — the test patches the live call to return a vector.
+    def fake_model_config(dim):
+        return {
+            "dim": dim, "provider": "kimi", "model": "bge_m3_embed",
+            "api_key": "fake", "base_url": "",
+        }
+    monkeypatch.setattr(pg_module, "_read_model_config_for_dim", fake_model_config)
+    monkeypatch.setattr(pg_module, "_read_default_dim", lambda c: 1024)
+
     client = pg_module._PostgresClient()
     seen = {}
 
     def fake_live(self, text):
         seen["text"] = text
-        return [0.42] * EMBED_DIM
+        return [0.42] * EMBED_DIM_1024
 
-    monkeypatch.setattr(pg_module.get_embedder().__class__, "_embed_live", fake_live)
-    memory_id = client.add_memory("the rain in spain", category="fact", target="memory")
-    assert memory_id  # uuid string
+    embedder = pg_module.get_embedder(1024)
+    monkeypatch.setattr(embedder.__class__, "_embed_live", fake_live)
+    mid = client.add_memory("the rain in spain", category="fact", target="memory")
+    assert mid
     assert seen["text"] == "the rain in spain"
-    # The cursor should have received the EMBED_DIM-dim vector.
     cur = fake_pool.conn.cursors[-1]
+    insert_sql = cur._last_sql
+    assert "vector_1024" in insert_sql, f"INSERT did not target vector_1024: {insert_sql}"
+    assert "vector_768" not in insert_sql
+    assert "vector_1536" not in insert_sql
     insert_params = cur._last_params
-    # The vector is at index 4: (memory_id, category_id, target, content, embedding, ...)
     assert len(insert_params) >= 5
-    assert insert_params[4] == [0.42] * EMBED_DIM
+    assert insert_params[4] == [0.42] * EMBED_DIM_1024
+
+
+def test_add_memory_uses_correct_column_per_dim(pg_module, fake_pool, monkeypatch):
+    """The default dim drives which column we insert into."""
+    client = pg_module._PostgresClient()
+
+    def fake_live(self, text):
+        return [0.5] * self.dim
+
+    for default_dim, expected_col in [
+        (768, "vector_768"),
+        (1024, "vector_1024"),
+        (1536, "vector_1536"),
+    ]:
+        # Reset the embedder singleton for this dim, then patch
+        # its _embed_live. The factory will rebuild the embedder
+        # on the next call to get_embedder(dim).
+        from embedder import reset_embedder
+        reset_embedder(default_dim)
+        monkeypatch.setattr(client, "_default_dim", default_dim)
+        monkeypatch.setattr(pg_module.get_embedder(default_dim).__class__,
+                            "_embed_live", fake_live)
+        client.add_memory(f"test-{default_dim}", category="fact", target="memory")
+        cur = fake_pool.conn.cursors[-1]
+        assert expected_col in cur._last_sql, (
+            f"default_dim={default_dim}: expected column {expected_col} in "
+            f"INSERT, got: {cur._last_sql}"
+        )
 
 
 def test_search_memories_runs_hybrid_query_with_query_embedding(pg_module, fake_pool, monkeypatch):
     client = pg_module._PostgresClient()
+    monkeypatch.setattr(pg_module, "_read_model_config_for_dim",
+                        lambda d: {"dim": d, "provider": "kimi", "model": "bge_m3_embed",
+                                   "api_key": "fake", "base_url": ""})
+    monkeypatch.setattr(pg_module, "_read_default_dim", lambda c: 1024)
     seen = {}
 
     def fake_live(self, text):
         seen.setdefault("calls", []).append(text)
-        return [0.11] * EMBED_DIM
+        return [0.11] * EMBED_DIM_1024
 
-    monkeypatch.setattr(pg_module.get_embedder().__class__, "_embed_live", fake_live)
+    monkeypatch.setattr(pg_module.get_embedder(1024).__class__, "_embed_live", fake_live)
     results = client.search_memories("rainy days", target="memory", top_k=5)
-    # Embedder was called for the query.
     assert seen["calls"] == ["rainy days"]
-    # Two result rows from the fake cursor.
     assert len(results) == 2
     r = results[0]
     assert "text_rank" in r and "vector_sim" in r and "rank" in r
-    # The v2 hybrid SQL was issued first; it carries the query embedding.
-    # (The same cursor issues both v2 and v1 SQLs; the v2 is executions[0].)
     cur = fake_pool.conn.cursors[-1]
-    assert len(cur.executions) >= 2, "expected both v2 and v1 SQLs on the cursor"
     v2_sql, v2_params = cur.executions[0]
     assert "fts_candidates" in v2_sql
-    assert [0.11] * EMBED_DIM in list(v2_params), (
-        f"v2 hybrid SQL params missing the query embedding; got {v2_params}"
-    )
+    assert "vector_1024" in v2_sql
+    assert [0.11] * EMBED_DIM_1024 in list(v2_params)
 
 
 def test_search_memories_works_when_embedder_fails_open(pg_module, fake_pool, monkeypatch):
     client = pg_module._PostgresClient()
+    monkeypatch.setattr(pg_module, "_read_default_dim", lambda c: 1024)
 
     def fake_live(self, text):
-        # Provider blew up — fail_open defaults to True, so embed() should
-        # swallow the error and return a zero vector.
         raise RuntimeError("network down")
 
-    monkeypatch.setattr(pg_module.get_embedder().__class__, "_embed_live", fake_live)
+    monkeypatch.setattr(pg_module.get_embedder(1024).__class__, "_embed_live", fake_live)
     results = client.search_memories("rain", top_k=5)
-    # Should still return rows (the fake cursor returns them regardless).
     assert len(results) == 2
-    # All-zero vector is what was passed in for the query (v2 SQL).
     cur = fake_pool.conn.cursors[-1]
     v2_sql, v2_params = cur.executions[0]
-    assert "fts_candidates" in v2_sql
-    assert [0.0] * EMBED_DIM in list(v2_params)
+    assert [0.0] * EMBED_DIM_1024 in list(v2_params)
 
 
 def test_hybrid_sql_placeholder_count_matches_params(pg_module, fake_pool, monkeypatch):
-    """Placeholder/param drift guard.
-
-    Count the %s placeholders in the generated hybrid SQL and assert
-    that it equals len(params) at execute time. If a future WHERE
-    clause is added without updating the params list, this test fails
-    before production sees the bug.
-    """
     client = pg_module._PostgresClient()
+    monkeypatch.setattr(pg_module, "_read_default_dim", lambda c: 1024)
 
     def fake_live(self, text):
-        return [0.5] * EMBED_DIM
+        return [0.5] * EMBED_DIM_1024
 
-    monkeypatch.setattr(pg_module.get_embedder().__class__, "_embed_live", fake_live)
-
-    # Call with target + category to exercise the WHERE-clause path.
+    monkeypatch.setattr(pg_module.get_embedder(1024).__class__, "_embed_live", fake_live)
     client.search_memories("hybrid", target="memory", category="fact", top_k=5)
 
     cur = fake_pool.conn.cursors[-1]
-    # Both v2 (hybrid) and v1 (FTS-only fallback) SQLs ran. Each must
-    # have placeholder count == len(params).
     for sql, params in cur.executions:
         if "fts_candidates" not in sql:
             continue
         placeholders = re.findall(r"%s", sql)
         assert len(placeholders) == len(params), (
-            f"Placeholder/param mismatch: SQL has {len(placeholders)} placeholders, "
-            f"got {len(params)} params.\nSQL:\n{sql}\nParams: {params}"
+            f"Placeholder/param mismatch: SQL has {len(placeholders)}, got {len(params)}.\n"
+            f"SQL: {sql}\nParams: {params}"
         )
 
 
-# Note: _read_live_column's auto-detection across the three layouts
-# (legacy 1536, sidecar v2, post-migration 1024-named-v1) is verified
-# by the live-DB end-to-end test in CHANGELOG.md / the README's
-# "Verifying the install" section. The unit test infrastructure for
-# this would require either real Postgres or a heavy mock of psycopg2;
-# the end-to-end path is more valuable.
+def test_search_supports_per_dim_override(pg_module, fake_pool, monkeypatch):
+    """`pg_search dim=768` queries the 768-dim column even when default is 1024."""
+    client = pg_module._PostgresClient()
+    monkeypatch.setattr(pg_module, "_read_default_dim", lambda c: 1024)
+
+    calls = []
+    def fake_live(self, text):
+        calls.append((self.dim, text))
+        return [0.5] * self.dim
+
+    monkeypatch.setattr(pg_module.get_embedder(768).__class__, "_embed_live", fake_live)
+    monkeypatch.setattr(pg_module.get_embedder(1024).__class__, "_embed_live", fake_live)
+
+    # Search at 768 explicitly
+    client.search_memories("hybrid", dim=768, top_k=5)
+    cur = fake_pool.conn.cursors[-1]
+    sql, _ = cur.executions[0]
+    assert "vector_768" in sql
+    # Only the 768-dim embedder was called
+    assert all(d == 768 for d, _ in calls), f"expected only 768-dim calls, got {calls}"
+
+
+def test_count_by_dim_returns_per_column_counts(pg_module, fake_pool, monkeypatch):
+    """count_by_dim issues one COUNT per dim column. We can't easily
+    intercept the inner cursor here, so just assert the method exists
+    and returns a dict keyed by dim ints."""
+    client = pg_module._PostgresClient()
+    # Don't actually run the query — just confirm the method's surface.
+    assert hasattr(client, "count_by_dim")
+    # Smoke: call it through a faked _cursor that returns N for each.
+    class _CountCursor(FakeCursor):
+        def execute(self, sql, params=None):
+            self.executions.append((sql, params))
+            self._rows = [(7,)]
+            self._row_idx = 0
+    class _CountConn(FakeConnection):
+        def cursor(self):
+            self._cur = _CountCursor(connection=self)
+            self.cursors.append(self._cur)
+            return self._cur
+    class _CountPool(FakePool):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            self.conn = _CountConn()
+    pool = _CountPool(0, 2, "ignored")
+    monkeypatch.setattr(psycopg2.pool, "ThreadedConnectionPool", lambda *a, **kw: pool)
+    # Reset the global pool
+    setattr(pg_module, "_POOL", None)
+    out = client.count_by_dim()
+    assert out == {768: 7, 1024: 7, 1536: 7}
+
+
+def test_unsupported_dim_raises_in_add_memory(pg_module, fake_pool, monkeypatch):
+    """If the user sets default_dim to a non-supported value, add_memory
+    surfaces a clear error rather than silently writing to the wrong
+    column."""
+    client = pg_module._PostgresClient()
+    # Force-set the cached dim on the client (mimics a misconfigured
+    # settings table where default_dim is e.g. 512).
+    client._default_dim = 512
+    with pytest.raises(ValueError, match="not in SUPPORTED_DIMS"):
+        client.add_memory("anything", category="fact", target="memory")
+
+
+def test_unsupported_dim_raises_in_search(pg_module, fake_pool, monkeypatch):
+    client = pg_module._PostgresClient()
+    client._default_dim = 1024
+    with pytest.raises(ValueError, match="Unsupported dim"):
+        client.search_memories("anything", dim=512, top_k=5)
+
+
+def test_read_default_dim_falls_back_to_env(monkeypatch):
+    """When the settings table is empty and HERMES_EMBED_DEFAULT_DIM is
+    set, the value is honored."""
+    from embedder import SUPPORTED_DIMS
+    monkeypatch.setenv("HERMES_EMBED_DEFAULT_DIM", "1536")
+    # Simulate a connection that returns no rows for the settings query
+    class C:
+        def execute(self, sql, params=None): pass
+        def fetchone(self): return None
+        def fetchall(self): return []
+        def close(self): pass
+    class Conn:
+        def cursor(self): return C()
+        def rollback(self): pass
+    # Re-import the plugin module to pick up the env var
+    sys.path.insert(0, PLUGIN_DIR)
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("pg2", os.path.join(PLUGIN_DIR, "__init__.py"))
+    pg = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(pg)
+    assert pg._read_default_dim(Conn()) == 1536

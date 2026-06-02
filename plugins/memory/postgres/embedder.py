@@ -1,48 +1,43 @@
 """Embedding provider for the PostgreSQL memory plugin.
 
-Pluggable embedding client. The same model MUST be used for every row in the
-agent_memory.content_vector column — pgvector's cosine/L2/inner-product
-operators only produce meaningful similarity scores when vectors share the
-same embedding space. If you switch models you must backfill the column.
+Pluggable embedding client with per-dim model dispatch. The plugin
+needs vectors at 768, 1024, or 1536 dims depending on the user's
+configured model. Each dim gets its own embedder instance, configured
+via the `agent_memory_models` SQL table (override via the CLI) or
+environment variables.
 
-Supported providers
--------------------
-- ``kimi`` (default): Moonshot/Kimi's OpenAI-compatible embedding endpoint at
-  https://api.kimi.com/coding/v1. Free with the KIMI_API_KEY already in
-  .env. Model ``bge_m3_embed`` returns 1024-dim, L2-normalized vectors.
-  Kimi's endpoint accepts 9+ model names as aliases (bge_m3_embed,
-  bge-m3, bge-large, bge-large-en, bge-large-zh, nomic-embed-text,
-  text-embedding-3-small, text-embedding-v1, embedding-2) but they all
-  return 1024 dims, so the model is purely a quality/style choice.
-- ``ollama_cloud``: Ollama Cloud's /api/embed endpoint. Free tier but the
-  public model catalog is currently chat-only; embedding models require a
-  self-hosted Ollama. Use ``ollama_local`` instead.
-- ``ollama_local``: same contract as ``ollama_cloud`` but points at a
-  self-hosted Ollama instance. Run ``ollama pull bge-m3`` (1024 dim) or
-  ``ollama pull nomic-embed-text`` (768 dim) on the host.
-- ``noop``: returns a zero vector. Used in tests and as a last-resort
-  fail-safe if the configured provider is unreachable.
+Why per-dim
+-----------
+Different providers serve different dims. Kimi's free endpoint
+serves 1024-dim vectors regardless of model alias. Ollama local can
+serve 768 (nomic-embed-text) or 1024 (bge-m3). OpenAI serves 1536
+(text-embedding-3-small) or 3072. The plugin handles three dims
+(768, 1024, 1536) out of the box and lets the user switch.
 
 Configuration
 -------------
-HERMES_EMBED_PROVIDER       one of: kimi, ollama_cloud, ollama_local, noop
-                            (default: kimi)
-HERMES_EMBED_MODEL          model name passed to the provider
-                            (default: bge_m3_embed)
-HERMES_EMBED_DIM            output dimension, must match the model
-                            (default: 1024 — enforced for bge_m3_embed)
-HERMES_EMBED_BASE_URL       API base URL
-                            (default: https://api.kimi.com/coding/v1 for kimi,
-                             https://ollama.com for ollama_cloud,
-                             http://localhost:11434 for ollama_local)
-HERMES_EMBED_API_KEY        API key (falls back to KIMI_API_KEY for the kimi
-                            provider, OLLAMA_API_KEY for ollama_cloud)
-HERMES_EMBED_TIMEOUT        request timeout in seconds (default: 10)
-HERMES_EMBED_CACHE_DIR      on-disk cache directory
-                            (default: ~/.cache/hermes/embeddings)
-HERMES_EMBED_CACHE          "1" to enable cache (default: 1), "0" disables
-HERMES_EMBED_FAIL_OPEN      "1" to fall back to zero vector on provider
-                            errors (default: 1). Set to "0" to raise.
+Per-dim model:    agent_memory_models table (override via CLI or SQL)
+Default dim:      agent_memory_settings.default_dim (override via CLI)
+Provider-specific env vars (HERMES_EMBED_*): see below.
+
+Env var fallback chain
+----------------------
+1. HERMES_EMBED_API_KEY_<DIM>      (e.g. HERMES_EMBED_API_KEY_1024)
+2. HERMES_EMBED_API_KEY            (shared)
+3. <api_key_env from SQL registry> (e.g. KIMI_API_KEY for kimi provider)
+4. KIMI_API_KEY or OLLAMA_API_KEY  (provider-specific fallback)
+
+Supported providers
+-------------------
+- ``kimi`` (default for 1024-dim): Moonshot/Kimi's OpenAI-compatible
+  embedding endpoint at https://api.kimi.com/coding/v1. Free with the
+  KIMI_API_KEY already in .env. Returns 1024-dim, L2-normalized.
+- ``ollama_local``: self-hosted Ollama. Run `ollama pull bge-m3` for
+  1024-dim or `ollama pull nomic-embed-text` for 768-dim.
+- ``ollama_cloud``: Ollama Cloud's /api/embed. Free tier is currently
+  chat-only; do not use this provider for embeddings.
+- ``noop``: returns a zero vector. Used in tests and as a last-resort
+  fail-safe if the configured provider is unreachable.
 """
 
 from __future__ import annotations
@@ -58,11 +53,14 @@ from typing import Iterable, List, Optional
 
 logger = logging.getLogger(__name__)
 
-# Default embedder settings.
-# These match the agent_memory.content_vector schema after the 1536 -> 1024
-# migration in migrations/001_embedding_dim.sql.
-DEFAULT_PROVIDER = "kimi"
-DEFAULT_MODEL = "bge_m3_embed"
+# Three dims supported out of the box. Adding a new dim requires:
+#   1. ALTER TABLE agent_memory ADD COLUMN vector_<dim> vector(<dim>);
+#   2. CREATE INDEX ... ON agent_memory USING hnsw (vector_<dim> ...);
+#   3. INSERT INTO agent_memory_models VALUES (<dim>, ...);
+#   4. Update SUPPORTED_DIMS below.
+SUPPORTED_DIMS = (768, 1024, 1536)
+
+# Default dim the plugin uses when no setting is configured.
 DEFAULT_DIM = 1024
 
 # Lazy-imported httpx keeps import-time cost off the hot path.
@@ -82,45 +80,55 @@ class EmbeddingError(RuntimeError):
 
 
 class Embedder:
-    """Embedding client with disk cache and fail-safe fallback.
+    """Embedding client for a single dim. Per-dim cache, fail-safe fallback.
 
-    Thread-safe. The disk cache is keyed by a SHA-256 of
-    ``(provider, model, content)`` so identical content from the same
-    configured model never hits the network twice.
+    The cache key includes the dim so two embedders at different dims
+    don't share cache entries. The cache is content-addressable:
+    sha256(provider|model|dim|text) means identical content from the
+    same configured model is a hit.
+
+    Multiple Embedder instances (one per dim) can coexist. The plugin
+    gets the right one via the module-level `get_embedder(dim=N)`
+    factory.
     """
 
-    def __init__(self, *, override: Optional[dict] = None) -> None:
-        provider = os.environ.get("HERMES_EMBED_PROVIDER", DEFAULT_PROVIDER)
-        # API key resolution: explicit HERMES_EMBED_API_KEY wins, else fall
-        # back to the platform's primary env var (KIMI_API_KEY for kimi,
-        # OLLAMA_API_KEY for ollama_*). This means existing .env files work
-        # without modification.
-        api_key = os.environ.get("HERMES_EMBED_API_KEY", "").strip()
-        if not api_key:
-            if provider == "kimi":
-                api_key = os.environ.get("KIMI_API_KEY", "").strip()
-            elif provider in ("ollama_cloud", "ollama_local"):
-                api_key = os.environ.get("OLLAMA_API_KEY", "").strip()
-        cfg = {
+    def __init__(self, *, dim: int, provider: str, model: str,
+                 api_key: str = "", base_url: str = "",
+                 cache_dir: Optional[str] = None,
+                 cache_enabled: bool = True,
+                 fail_open: bool = True,
+                 timeout: float = 10.0) -> None:
+        if dim not in SUPPORTED_DIMS:
+            raise ValueError(
+                f"Unsupported dim: {dim}. Supported: {SUPPORTED_DIMS}. "
+                f"Add an ALTER TABLE migration before using a new dim."
+            )
+        # Resolve cache_dir from env if not explicitly given. This
+        # makes the factory's _read_model_config_for_dim able to
+        # pass through "the user wants a per-test cache dir" via
+        # env vars without the SQL path needing to know about them.
+        if not cache_dir:
+            cache_dir = (
+                os.environ.get(f"HERMES_EMBED_CACHE_DIR_{dim}")
+                or os.environ.get("HERMES_EMBED_CACHE_DIR")
+                or ""
+            )
+        self._cfg = {
+            "dim": dim,
             "provider": provider,
-            "model": os.environ.get("HERMES_EMBED_MODEL", DEFAULT_MODEL),
-            "dim": int(os.environ.get("HERMES_EMBED_DIM", str(DEFAULT_DIM))),
-            "base_url": os.environ.get("HERMES_EMBED_BASE_URL", "").strip(),
+            "model": model,
             "api_key": api_key,
-            "timeout": float(os.environ.get("HERMES_EMBED_TIMEOUT", "10")),
-            "cache_dir": os.environ.get(
-                "HERMES_EMBED_CACHE_DIR",
-                str(Path.home() / ".cache" / "hermes" / "embeddings"),
+            "base_url": base_url,
+            "timeout": timeout,
+            "cache_dir": cache_dir or str(
+                Path.home() / ".cache" / "hermes" / "embeddings" / str(dim)
             ),
-            "cache_enabled": os.environ.get("HERMES_EMBED_CACHE", "1") != "0",
-            "fail_open": os.environ.get("HERMES_EMBED_FAIL_OPEN", "1") == "1",
+            "cache_enabled": cache_enabled,
+            "fail_open": fail_open,
         }
-        if override:
-            cfg.update({k: v for k, v in override.items() if v is not None})
-        self._cfg = cfg
         self._lock = threading.Lock()
         self._cache_lock = threading.Lock()
-        self._cache: dict[str, List[float]] = {}
+        self._cache: dict = {}
         self._cache_loaded = False
         self._stats = {"hits": 0, "misses": 0, "errors": 0, "zero_fallbacks": 0}
 
@@ -164,16 +172,18 @@ class Embedder:
         used_fallback = False
         try:
             vector = self._embed_live(text)
-        except Exception as exc:  # network, auth, dimension mismatch, ...
+        except Exception as exc:  # network, auth, dim mismatch, ...
             self._stats["errors"] += 1
-            logger.warning("Embedding provider failed: %s", exc)
+            logger.warning(
+                "Embedding provider failed (dim=%d, provider=%s, model=%s): %s",
+                self.dim, self.provider, self.model, exc,
+            )
             if not self._cfg["fail_open"]:
                 raise EmbeddingError(f"Embedding failed: {exc}") from exc
             self._stats["zero_fallbacks"] += 1
             used_fallback = True
             vector = [0.0] * self.dim
-        # 3a) contract check: a successful embed that returns the wrong
-        # dim silently corrupts the vector column. Refuse the result.
+        # 3a) contract check
         if len(vector) != self.dim:
             self._stats["errors"] += 1
             logger.warning(
@@ -187,15 +197,9 @@ class Embedder:
             self._stats["zero_fallbacks"] += 1
             used_fallback = True
             vector = [0.0] * self.dim
-        # 3b) refuse to cache zero-fallback vectors. A zero vec stored in
-        # the cache would short-circuit a future retry once the underlying
-        # provider issue is fixed, leaving bad data in the DB. The correct
-        # behavior on transient failure is to fall back for this call but
-        # NOT poison the cache for next time. (The `noop` provider
-        # deliberately returns zeros and DOES cache them; this guard only
-        # blocks vectors produced by the fail-open safety net.)
+        # 3b) refuse to cache zero-fallback vectors
         if used_fallback:
-            logger.debug("Skipping cache write for zero-fallback vector")
+            logger.debug("Skipping cache write for zero-fallback vector (dim=%d)", self.dim)
             return vector
         # 4) cache
         if self._cfg["cache_enabled"]:
@@ -205,22 +209,15 @@ class Embedder:
         return vector
 
     def embed_batch(self, texts: Iterable[str]) -> List[List[float]]:
-        """Embed multiple texts. Falls back to per-item embed on batch errors."""
-        items = list(texts)
-        if not items:
-            return []
-        # Many providers support batch; we still call per-item for simplicity
-        # and so the cache short-circuits each one.
-        return [self.embed(t) for t in items]
+        return [self.embed(t) for t in texts]
 
     # ── Internals ──────────────────────────────────────────────────────────
 
     def _cache_key(self, text: str) -> str:
-        payload = f"{self._cfg['provider']}|{self._cfg['model']}|{text}"
+        payload = f"{self._cfg['dim']}|{self._cfg['provider']}|{self._cfg['model']}|{text}"
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
     def _cache_path(self) -> Path:
-        # Shard by first 2 hex chars of the key to avoid huge directories.
         p = Path(self._cfg["cache_dir"])
         p.mkdir(parents=True, exist_ok=True)
         return p
@@ -244,16 +241,15 @@ class Embedder:
             path.mkdir(parents=True, exist_ok=True)
             (path / f"{key}.json").write_text(
                 json.dumps({
+                    "dim": self.dim,
                     "provider": self._cfg["provider"],
                     "model": self._cfg["model"],
-                    "dim": self.dim,
                     "vector": vector,
                     "ts": int(time.time()),
                 }),
                 "utf-8",
             )
         except Exception as exc:
-            # Disk cache is best-effort.
             logger.debug("Embedding disk cache write failed: %s", exc)
 
     def _embed_live(self, text: str) -> List[float]:
@@ -271,7 +267,7 @@ class Embedder:
             return self._embed_ollama(text)
         raise EmbeddingError(
             f"Unknown embedding provider: {provider!r}. "
-            f"Set HERMES_EMBED_PROVIDER to one of: kimi, ollama_cloud, ollama_local, noop."
+            f"Set HERMES_EMBED_PROVIDER to one of: kimi, ollama_local, ollama_cloud, noop."
         )
 
     def _embed_openai_compat(
@@ -282,9 +278,6 @@ class Embedder:
         text_payload_key: str,
         text_payload_value,
     ) -> List[float]:
-        """Hit an OpenAI-compatible /v1/embeddings-style endpoint and parse
-        the response. Used by the kimi provider today; reusable for any future
-        OpenAI-shape endpoint (OpenRouter, Together, vLLM, etc.)."""
         base = self._cfg["base_url"] or default_base
         base = base.rstrip("/")
         url = f"{base}{path}"
@@ -300,7 +293,6 @@ class Embedder:
                 f"Embed endpoint returned {resp.status_code}: {resp.text[:300]}"
             )
         data = resp.json()
-        # OpenAI shape: {"object":"list","data":[{"index":0,"embedding":[...]}]}
         if "data" in data and data["data"]:
             vec = data["data"][0].get("embedding")
             if vec is None:
@@ -308,7 +300,6 @@ class Embedder:
                     f"Embed response missing 'embedding' in data[0]: {list(data.keys())}"
                 )
             return [float(x) for x in vec]
-        # Other shapes some gateways use:
         if "embedding" in data:
             return [float(x) for x in data["embedding"]]
         if "embeddings" in data and data["embeddings"]:
@@ -338,8 +329,6 @@ class Embedder:
                 f"Ollama embed returned {resp.status_code}: {resp.text[:300]}"
             )
         data = resp.json()
-        # Ollama /api/embed returns: {"model": "...", "embeddings": [[...]]}
-        # Older /api/embeddings returns: {"embedding": [...]}
         if "embeddings" in data and data["embeddings"]:
             vec = data["embeddings"][0]
         elif "embedding" in data:
@@ -355,25 +344,136 @@ class Embedder:
         return [float(x) for x in vec]
 
 
-# ── Module-level singleton ────────────────────────────────────────────────
-# Reused across the process. The schema and the model must agree; if the
-# process is misconfigured, fail fast at first use.
-_singleton: Optional[Embedder] = None
-_singleton_lock = threading.Lock()
+# ── Module-level per-dim singleton registry ──────────────────────────────
+
+_singletons: dict = {}  # dim → Embedder
+_singletons_lock = threading.Lock()
 
 
-def get_embedder() -> Embedder:
-    global _singleton
-    if _singleton is not None:
-        return _singleton
-    with _singleton_lock:
-        if _singleton is None:
-            _singleton = Embedder()
-    return _singleton
+def get_embedder(dim: int) -> Embedder:
+    """Get (or create) the Embedder singleton for the given dim.
+
+    The factory looks up the model config in this order:
+      1. In-process Python overrides (if any were set via set_override)
+      2. The `agent_memory_models` SQL table (the live source of truth)
+      3. Hard-coded defaults per dim
+    """
+    if dim not in SUPPORTED_DIMS:
+        raise ValueError(
+            f"Unsupported dim: {dim}. Supported: {SUPPORTED_DIMS}."
+        )
+    if dim in _singletons:
+        return _singletons[dim]
+    with _singletons_lock:
+        if dim in _singletons:
+            return _singletons[dim]
+        # Try to load config from SQL via the plugin's _read_model_config_for_dim.
+        # If unavailable (e.g. tests), fall back to env-based config.
+        #
+        # We resolve the function through sys.modules rather than a
+        # hardcoded `from plugins.memory.postgres import ...` so that
+        # tests which load the plugin under a different module name
+        # (e.g. via importlib.util.spec_from_file_location) can still
+        # monkeypatch the function.
+        cfg = _resolve_model_config(dim)
+        embedder = Embedder(**cfg)
+        _singletons[dim] = embedder
+        return embedder
 
 
-def reset_embedder() -> None:
-    """Drop the singleton. Used by tests."""
-    global _singleton
-    with _singleton_lock:
-        _singleton = None
+def _resolve_model_config(dim: int) -> dict:
+    """Find the plugin's _read_model_config_for_dim via sys.modules, then
+    fall back to env-based defaults if no plugin module is loaded yet.
+
+    We walk sys.modules looking for a module that defines
+    _read_model_config_for_dim and is NOT this embedder module itself.
+    The first match wins. If none found (or it raises), fall back to
+    the env-based defaults baked into _default_model_config_for_dim.
+    """
+    import sys as _sys
+    for mod_name, mod in list(_sys.modules.items()):
+        if mod is None or mod_name == __name__:
+            continue
+        # The plugin module is anything under plugins/memory/postgres/,
+        # or anything that has _read_model_config_for_dim as a top-level
+        # callable (not inherited).
+        if mod is not None and "_read_model_config_for_dim" in dir(mod):
+            attr = getattr(mod, "_read_model_config_for_dim", None)
+            if callable(attr) and getattr(attr, "__module__", "") != __name__:
+                try:
+                    return attr(dim)
+                except Exception:
+                    break
+    return _default_model_config_for_dim(dim)
+
+
+def _default_model_config_for_dim(dim: int) -> dict:
+    """Hard-coded defaults for the per-dim model config.
+
+    Used when the SQL registry is unavailable (tests, fresh boot
+    before the settings table is created). The live plugin always
+    uses the SQL registry.
+    """
+    cache_dir = (
+        os.environ.get(f"HERMES_EMBED_CACHE_DIR_{dim}")
+        or os.environ.get("HERMES_EMBED_CACHE_DIR")
+        or ""
+    )
+    if dim == 768:
+        return {
+            "dim": 768,
+            "provider": os.environ.get("HERMES_EMBED_PROVIDER_768", "ollama_local"),
+            "model": os.environ.get("HERMES_EMBED_MODEL_768", "nomic-embed-text"),
+            "api_key": _resolve_api_key(768, "ollama_local"),
+            "base_url": os.environ.get("HERMES_EMBED_BASE_URL_768", ""),
+            "cache_dir": cache_dir,
+        }
+    if dim == 1024:
+        return {
+            "dim": 1024,
+            "provider": os.environ.get("HERMES_EMBED_PROVIDER_1024", "kimi"),
+            "model": os.environ.get("HERMES_EMBED_MODEL_1024", "bge_m3_embed"),
+            "api_key": _resolve_api_key(1024, "kimi"),
+            "base_url": os.environ.get("HERMES_EMBED_BASE_URL_1024", ""),
+            "cache_dir": cache_dir,
+        }
+    if dim == 1536:
+        return {
+            "dim": 1536,
+            "provider": os.environ.get("HERMES_EMBED_PROVIDER_1536", "kimi"),
+            "model": os.environ.get("HERMES_EMBED_MODEL_1536", "text-embedding-3-small"),
+            "api_key": _resolve_api_key(1536, "kimi"),
+            "base_url": os.environ.get("HERMES_EMBED_BASE_URL_1536", ""),
+            "cache_dir": cache_dir,
+        }
+    raise ValueError(dim)
+
+
+def _resolve_api_key(dim: int, provider: str) -> str:
+    """Resolve the API key for a given dim + provider, in priority order."""
+    explicit = os.environ.get(f"HERMES_EMBED_API_KEY_{dim}", "").strip()
+    if explicit:
+        return explicit
+    shared = os.environ.get("HERMES_EMBED_API_KEY", "").strip()
+    if shared:
+        return shared
+    if provider == "kimi":
+        return os.environ.get("KIMI_API_KEY", "").strip()
+    if provider in ("ollama_cloud", "ollama_local"):
+        return os.environ.get("OLLAMA_API_KEY", "").strip()
+    return ""
+
+
+def reset_embedder(dim: Optional[int] = None) -> None:
+    """Drop the cached embedder(s). Used by tests and the model-set CLI."""
+    global _singletons
+    with _singletons_lock:
+        if dim is None:
+            _singletons = {}
+        elif dim in _singletons:
+            del _singletons[dim]
+
+
+def get_all_embedders() -> List[Embedder]:
+    """Return one Embedder per supported dim (used by the backfill script)."""
+    return [get_embedder(d) for d in SUPPORTED_DIMS]

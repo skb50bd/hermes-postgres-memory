@@ -3,27 +3,18 @@
 PostgreSQL + pgvector backed persistent memory. Uses the existing
 agent_memory table with:
 
-- Vector embeddings (1024 dims by default — BGE-M3 family) via pgvector
-- HNSW index for fast similarity search
-- Full-text search (GIN index on to_tsvector)
-- Hybrid search combining vector + text relevance
-- Categories, tags, JSONB metadata, TTL, soft deletes
-- Non-destructive schema migration (sidecar v2 column)
-- Auto-detects the live vector column at runtime — works whether you
-  have a single 1024-dim content_vector, a sidecar content_vector_v2,
-  or a legacy 1536-dim content_vector
-- Pluggable embedder: kimi (free default), ollama_local, noop
-- Content-addressable disk cache for embeddings (sha256 of provider|model|text)
-- Fail-open embedder: provider errors fall back to zero vector; zero-fallback
-  vectors are NOT cached (defense against cache poisoning)
-
-Schema upgrade history
-----------------------
-- 1.0.x — agent_memory.content_vector vector(1536), zero-vector placeholder.
-  Never actually used; the column was an unused scaffold.
-- 1.1.0 — content_vector_v2 vector(1024) sidecar; content_vector retained
-  for non-destructive upgrade. Run migrations 001..005 in order.
-  After 005_drop_v1_column.sql, only content_vector_v2 remains.
+- Vector embeddings at 768, 1024, or 1536 dims (per-dim columns, all
+  indexed with HNSW). The default dim is configurable at runtime.
+- Pluggable per-dim embedder registry: agent_memory_models table maps
+  each dim to a (provider, model, api_key_env) triple. Switch dims
+  with `hermes postgres-memory model-set --dim <768|1024|1536>`.
+- Non-destructive migration: three vector columns all nullable, plus
+  a legacy `content_vector` for upgrade compatibility.
+- Hybrid search: FTS pre-filter → cosine re-rank on the default-dim column.
+- Categories, tags, JSONB metadata, TTL, soft deletes.
+- Content-addressable embedding cache (sha256 of dim|provider|model|text).
+- Fail-open embedder: provider errors fall back to zero vector; zero-
+  fallback vectors are NOT cached (defense against cache poisoning).
 
 Config via environment variables:
     POSTGRES_HOST      — Database host (default: localhost)
@@ -31,10 +22,9 @@ Config via environment variables:
     POSTGRES_USER      — Database user (default: hermes)
     POSTGRES_PASSWORD  — Database password (required)
     POSTGRES_DATABASE  — Database name (default: hermes)
-    HERMES_EMBED_PROVIDER — kimi, ollama_cloud, ollama_local, or noop
-    HERMES_EMBED_MODEL    — model name (default: bge_m3_embed)
-    HERMES_EMBED_DIM      — output dim (default: 1024)
-    HERMES_EMBED_API_KEY  — API key (falls back to KIMI_API_KEY / OLLAMA_API_KEY)
+    HERMES_EMBED_DEFAULT_DIM — Override default dim if SQL is unavailable
+    HERMES_EMBED_PROVIDER_<DIM> / HERMES_EMBED_MODEL_<DIM> /
+    HERMES_EMBED_BASE_URL_<DIM> / HERMES_EMBED_API_KEY_<DIM> — per-dim
 """
 
 from __future__ import annotations
@@ -56,32 +46,31 @@ from psycopg2.extras import register_uuid
 from agent.memory_provider import MemoryProvider
 from tools.registry import tool_error
 
-# The embedder is a sibling of __init__.py inside the same plugin dir.
-# When the plugin is installed under ~/.hermes/hermes-agent/plugins/memory/postgres/
-# the standard `from embedder import ...` works because the plugin's
-# parent package is on sys.path. When the plugin is loaded as a packaged
-# module (e.g. by a test fixture) we add the plugin dir to sys.path first.
+# Embedder is a sibling of __init__.py inside the plugin dir. Add the
+# plugin dir to sys.path so the import resolves when the plugin is
+# loaded as a leaf module (e.g. by tests).
 import sys as _sys
 _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in _sys.path:
     _sys.path.insert(0, _HERE)
-from embedder import Embedder, EmbeddingError, get_embedder  # noqa: E402
+from embedder import (  # noqa: E402
+    Embedder, EmbeddingError, SUPPORTED_DIMS, DEFAULT_DIM,
+    get_embedder, reset_embedder, get_all_embedders,
+)
 
 logger = logging.getLogger(__name__)
 
 # Register UUID adapter for psycopg2
 register_uuid()
 
-# Module-level connection pool. Thread-safe via lock. We do NOT wrap each
-# _PostgresClient in its own lock — the connection pool is already
+# Module-level connection pool. Thread-safe via lock. We do NOT wrap
+# each _PostgresClient in its own lock — the connection pool is already
 # thread-safe, and a per-client lock would serialize all DB ops across
 # the entire process, defeating the point of pooling.
 _POOL = None
 _POOL_LOCK = threading.Lock()
 
 # How many rows the FTS pre-filter fetches before vector re-rank.
-# Override at runtime with HERMES_POSTGRES_FTS_WINDOW if you have a
-# very small or very large active row count.
 _FTS_WINDOW_OVERFETCH = 4
 _FTS_WINDOW_MIN = 40
 
@@ -92,7 +81,6 @@ _HYBRID_TEXT_WEIGHT = 0.5
 
 
 def _env_float(name: str, default: float, *, minimum: float = 0.0, maximum: float = 1.0) -> float:
-    """Parse a float env setting, clamped to [minimum, maximum]."""
     raw = os.environ.get(name, "")
     if not raw:
         return default
@@ -121,28 +109,20 @@ def _postgres_dsn() -> str:
     user = os.environ.get("POSTGRES_USER", "hermes")
     password = os.environ.get("POSTGRES_PASSWORD", "")
     database = os.environ.get("POSTGRES_DATABASE", "hermes")
-
     if not password:
         raise RuntimeError("POSTGRES_PASSWORD is not set")
-
     connect_timeout = _env_int("HERMES_POSTGRES_CONNECT_TIMEOUT", 5, minimum=1)
     statement_timeout = _env_int("HERMES_POSTGRES_STATEMENT_TIMEOUT_MS", 10_000, minimum=100)
     idle_tx_timeout = _env_int("HERMES_POSTGRES_IDLE_TX_TIMEOUT_MS", 30_000, minimum=100)
     return make_dsn(
-        host=host,
-        port=port,
-        dbname=database,
-        user=user,
-        password=password,
-        sslmode="prefer",
-        connect_timeout=connect_timeout,
+        host=host, port=port, dbname=database, user=user, password=password,
+        sslmode="prefer", connect_timeout=connect_timeout,
         application_name="hermes-memory-postgres",
         options=f"-c statement_timeout={statement_timeout} -c idle_in_transaction_session_timeout={idle_tx_timeout}",
     )
 
 
 def _get_pool():
-    """Return the process-local bounded connection pool."""
     global _POOL
     if _POOL is not None:
         return _POOL
@@ -158,7 +138,6 @@ def _get_pool():
 
 
 def _close_pool() -> None:
-    """Close all pooled PostgreSQL connections in this process."""
     global _POOL
     with _POOL_LOCK:
         if _POOL is None:
@@ -168,162 +147,126 @@ def _close_pool() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Vector column dispatch
+# Column / dim resolution
 # ---------------------------------------------------------------------------
-#
-# The plugin supports two layouts:
-#
-#   v1 (legacy 1.0.x): a single content_vector vector(1536) column. The
-#       column held zero vectors; never actually used.
-#   v2 (post-1.1.0 migration): a content_vector_v2 vector(1024) sidecar.
-#       The original content_vector may still exist (pre-cutover) or may
-#       have been dropped (post-cutover).
-#
-# At runtime the plugin reads agent_memory_settings.live_vector_column
-# to determine which column to use. This is a per-process config knob
-# that the migration can flip without restarting Hermes.
-#
-# The two columns are NEVER blended: a row is "in v2" if v2 is non-null,
-# "in v1" otherwise. Hybrid search over a mixed table returns v2 rows
-# first (vector re-rank on 1024-dim) and falls back to v1 rows (FTS only)
-# in a separate pass.
-#
-# v1 layout returns hybrid search with vector_sim = NULL (the dim doesn't
-# match the live embedder), so the v1 fallback uses text_rank only.
 
-_V2_COLUMN = "content_vector_v2"
-_VV1_COLUMN = "content_vector"  # legacy name when v1 dim happens to be 1024
+def _vector_column_for_dim(dim: int) -> str:
+    """Map a dim to the canonical column name in agent_memory."""
+    if dim == 768:
+        return "vector_768"
+    if dim == 1024:
+        return "vector_1024"
+    if dim == 1536:
+        return "vector_1536"
+    raise ValueError(
+        f"Unsupported dim {dim}. Supported: {SUPPORTED_DIMS}. "
+        f"Run a migration to add a vector_<dim> column first."
+    )
 
 
-def _live_column_name(live: str) -> str:
-    """Resolve the runtime live_column to an actual column name on disk.
+def _read_default_dim(conn) -> int:
+    """Read the default dim from agent_memory_settings.
 
-    Most users are in one of two states:
-      - 'v1' (legacy 1536-dim)   → write/read content_vector
-      - 'v2' (post-sidecar)      → write/read content_vector_v2
-
-    A third state exists for users who already did a destructive 1024-dim
-    migration (e.g. from the pre-1.1.0 code path) and have a single
-    content_vector at 1024-dim. We treat them as 'v2' and write/read
-    content_vector (the legacy name).
+    Returns one of: 768, 1024, 1536. Falls back to env or DEFAULT_DIM
+    if the settings table doesn't exist yet (fresh install) or the
+    row is missing. The fallback chain is:
+      1. agent_memory_settings.default_dim  (live source of truth)
+      2. HERMES_EMBED_DEFAULT_DIM env var
+      3. 1024 (DEFAULT_DIM)
     """
-    if live == "v2_named_v1":
-        return _VV1_COLUMN
-    if live == "v2":
-        return _V2_COLUMN
-    return _VV1_COLUMN
-
-
-def _read_live_column(conn) -> str:
-    """Determine which vector column the plugin should use.
-
-    Returns one of: 'v1', 'v2'. Reads
-    agent_memory_settings.live_vector_column; defaults to 'v1' if the
-    settings table doesn't exist yet (fresh install) or the row is
-    missing. Falls back to 'v1' for any error — we prefer a working
-    plugin over a crashed one.
-
-    If the settings table says 'v2' but the v2 column doesn't exist
-    (e.g. the user is on the new layout with a single 1024-dim column
-    named `content_vector`), auto-detect by inspecting which columns
-    actually exist. This lets the plugin handle the three possible
-    layouts without a forced migration:
-
-      - legacy 1536-dim: only content_vector exists → 'v1'
-      - sidecar v2:      both columns exist → 'v2' (per settings)
-      - new layout:      only content_vector_v2 exists → 'v2'
-      - mid-migration:   only content_vector exists at 1024-dim →
-                         legacy destructive migration; treat as v2
-                         (the column has the right dim, so cosine
-                         similarity will work, but the name is v1)
-    """
-    # Step 1: ask the settings table what the user configured.
+    configured = None
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT value FROM agent_memory_settings WHERE key = 'live_vector_column'"
+                "SELECT value FROM agent_memory_settings WHERE key = 'default_dim'"
             )
             row = cur.fetchone()
-        configured = None
-        if row and row[0] in ('"v1"', '"v2"'):
-            configured = row[0].strip('"')
+        if row:
+            # value is JSONB, e.g. '1024' (a JSON number-as-string).
+            try:
+                configured = int(row[0])
+            except (TypeError, ValueError):
+                pass
     except psycopg2.errors.UndefinedTable:
-        # The settings table doesn't exist yet. New install or pre-1.1.0
-        # upgrade. Need to clear the aborted-txn state before issuing
-        # the next query on the same connection.
         try:
             conn.rollback()
         except Exception:
             pass
-        configured = None
     except Exception as exc:
-        logger.debug("live_column settings lookup failed: %s", exc)
+        logger.debug("default_dim lookup failed: %s", exc)
         try:
             conn.rollback()
         except Exception:
             pass
-        configured = None
 
-    # Step 2: check which columns actually exist and their dims.
+    if configured in SUPPORTED_DIMS:
+        return configured
+    env_val = os.environ.get("HERMES_EMBED_DEFAULT_DIM", "").strip()
+    if env_val:
+        try:
+            v = int(env_val)
+            if v in SUPPORTED_DIMS:
+                return v
+        except ValueError:
+            pass
+    return DEFAULT_DIM
+
+
+def _read_model_config_for_dim(dim: int) -> dict:
+    """Read per-dim embedder config from the agent_memory_models table.
+
+    Returns a dict suitable for `Embedder(**dict)`. Falls back to the
+    embedder's hard-coded defaults if the table is unavailable.
+    """
+    try:
+        import psycopg2 as _psy
+        conn = _psy.connect(
+            host=os.environ.get("POSTGRES_HOST", "localhost"),
+            port=int(os.environ.get("POSTGRES_PORT", "5432")),
+            user=os.environ.get("POSTGRES_USER", "hermes"),
+            password=os.environ["POSTGRES_PASSWORD"],
+            dbname=os.environ.get("POSTGRES_DATABASE", "hermes"),
+            connect_timeout=5,
+        )
+    except Exception as exc:
+        logger.debug("model config read failed: %s", exc)
+        # Fall back to defaults
+        from embedder import _default_model_config_for_dim
+        return _default_model_config_for_dim(dim)
+
     try:
         with conn.cursor() as cur:
             cur.execute(
-                """
-                SELECT column_name,
-                       format_type(a.atttypid, a.atttypmod) AS vector_type
-                FROM information_schema.columns c
-                JOIN pg_attribute a
-                  ON a.attrelid = (c.table_schema || '.' || c.table_name)::regclass
-                 AND a.attname = c.column_name
-                WHERE c.table_name = 'agent_memory'
-                  AND c.column_name IN ('content_vector', 'content_vector_v2')
-                """
+                "SELECT provider, model, base_url, api_key_env "
+                "FROM agent_memory_models WHERE dim = %s",
+                (dim,),
             )
-            rows = cur.fetchall()
-        existing = {r[0] for r in rows}
-        # Map column → dim (None for non-vector columns).
-        dims: dict = {}
-        for r in rows:
-            col, vtype = r[0], r[1]
-            if vtype and vtype.startswith("vector("):
-                try:
-                    dims[col] = int(vtype[7:-1])
-                except ValueError:
-                    pass
-    except Exception as exc:
-        logger.debug("live_column column inspection failed: %s", exc)
-        return configured or "v1"
-
-    # Step 3: reconcile.
-    has_v2 = "content_vector_v2" in existing
-    has_v1 = "content_vector" in existing
-    v1_dim = dims.get("content_vector")
-
-    if configured == "v2":
-        if has_v2:
-            return "v2"
-        if has_v1 and v1_dim == 1024:
-            # User said v2 but only v1 exists at 1024-dim. Probably
-            # they did the destructive migration from the pre-1.1.0
-            # code path. Treat as v2 with the legacy column name.
-            logger.info(
-                "live_vector_column='v2' but content_vector_v2 is missing; "
-                "using content_vector (1024-dim) as the live column. "
-                "Run the migration if you want to align with the new layout."
-            )
-            return "v2_named_v1"
-    if configured == "v1" and not has_v1 and has_v2:
-        return "v2"
-
-    if has_v1 and not has_v2 and v1_dim == 1024:
-        # Single content_vector at 1024-dim — this is the legacy
-        # destructive migration. Auto-detect as v2.
-        return "v2_named_v1"
-    if has_v1 and not has_v2:
-        return "v1"
-    if has_v2 and not has_v1:
-        return "v2"
-    return configured or "v1"
+            row = cur.fetchone()
+        if not row:
+            from embedder import _default_model_config_for_dim
+            return _default_model_config_for_dim(dim)
+        provider, model, base_url, api_key_env = row
+        # Resolve the API key from the named env var, with a few fallbacks.
+        api_key = ""
+        if api_key_env:
+            api_key = os.environ.get(api_key_env, "").strip()
+        if not api_key:
+            api_key = os.environ.get(f"HERMES_EMBED_API_KEY_{dim}", "").strip()
+        if not api_key:
+            api_key = os.environ.get("HERMES_EMBED_API_KEY", "").strip()
+        if not api_key and provider == "kimi":
+            api_key = os.environ.get("KIMI_API_KEY", "").strip()
+        if not api_key and provider in ("ollama_local", "ollama_cloud"):
+            api_key = os.environ.get("OLLAMA_API_KEY", "").strip()
+        return {
+            "dim": dim,
+            "provider": provider,
+            "model": model,
+            "api_key": api_key,
+            "base_url": base_url or os.environ.get(f"HERMES_EMBED_BASE_URL_{dim}", ""),
+        }
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -335,33 +278,31 @@ class _PostgresClient:
 
     NOTE: this client is intentionally lock-free. The connection pool
     is already thread-safe; a per-client lock would serialize all DB
-    ops and defeat the point of pooling. If you find yourself wanting
-    a per-client lock, the right answer is probably a finer-grained
-    lock around a specific shared state, not a blanket lock here.
+    ops and defeat the point of pooling.
     """
 
     def __init__(self):
-        _get_pool()  # warm the pool at construction
-        # Live column is per-process state. It changes rarely (only at
-        # migration cutover), so we cache it on the client instance.
+        _get_pool()  # warm the pool
+        # Read default_dim from the settings table once at init.
         with self._cursor() as cur:
-            self._live_column = _read_live_column(cur.connection)
-        logger.info("postgres-memory plugin using live_vector_column=%s", self._live_column)
+            self._default_dim = _read_default_dim(cur.connection)
+        logger.info("postgres-memory plugin default_dim=%d", self._default_dim)
 
     @property
-    def live_column(self) -> str:
-        return self._live_column
+    def default_dim(self) -> int:
+        return self._default_dim
 
-    def refresh_live_column(self) -> str:
-        """Re-read the live column from the settings table. Called after
-        migrations or from the cutover CLI."""
+    def refresh_default_dim(self) -> int:
+        """Re-read the default dim. Called after `model-set`."""
         with self._cursor() as cur:
-            self._live_column = _read_live_column(cur.connection)
-        return self._live_column
+            self._default_dim = _read_default_dim(cur.connection)
+        # The per-dim embedder singleton may have stale config; drop it
+        # so the next call rebuilds from SQL.
+        reset_embedder(self._default_dim)
+        return self._default_dim
 
     @contextmanager
     def _cursor(self) -> Iterator[Any]:
-        """Yield a fresh pooled cursor and always return the connection."""
         pool = _get_pool()
         conn = pool.getconn()
         cur = None
@@ -389,14 +330,17 @@ class _PostgresClient:
         confidence: int = 80,
         expires_at: Optional[datetime] = None,
     ) -> str:
-        """Insert a memory. Returns the new memory ID.
-
-        Writes to the live vector column (v1 or v2 depending on the
-        runtime config). Embeds the content via the configured embedder;
-        fail-open returns a zero vector if the provider is down.
-        """
-        column = _live_column_name(self._live_column)
-        embedding = get_embedder().embed(content)
+        """Insert a memory. Embeds at the default dim and writes to
+        the matching column. Other dim columns are left null (you can
+        backfill them later via the backfill script)."""
+        if self._default_dim not in SUPPORTED_DIMS:
+            raise ValueError(
+                f"Configured default_dim {self._default_dim} is not in "
+                f"SUPPORTED_DIMS {list(SUPPORTED_DIMS)}. Update "
+                f"agent_memory_settings.default_dim to 768, 1024, or 1536."
+            )
+        column = _vector_column_for_dim(self._default_dim)
+        embedding = get_embedder(self._default_dim).embed(content)
 
         with self._cursor() as cur:
             cur.execute("SELECT id FROM memory_categories WHERE name = %s", (category,))
@@ -418,19 +362,9 @@ class _PostgresClient:
                 VALUES (%s, %s, %s, %s, %s::vector, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
-                    memory_id,
-                    category_id,
-                    target,
-                    content,
-                    embedding,
-                    confidence,
-                    True,
-                    now,
-                    now,
-                    expires_at,
-                    tags or [],
-                    json.dumps(metadata or {}),
-                    None,
+                    memory_id, category_id, target, content, embedding,
+                    confidence, True, now, now, expires_at,
+                    tags or [], json.dumps(metadata or {}), None,
                 ),
             )
             return str(memory_id)
@@ -441,17 +375,20 @@ class _PostgresClient:
         target: Optional[str] = None,
         category: Optional[str] = None,
         top_k: int = 10,
+        dim: Optional[int] = None,
     ) -> List[Dict]:
-        """Hybrid search: combines full-text search with vector similarity.
+        """Hybrid search: FTS pre-filter + cosine re-rank on the dim-
+        matching column. The `dim` parameter overrides default_dim
+        (use it to search at a non-default dim). Passing a non-supported
+        dim raises ValueError — explicit > implicit."""
+        if dim is not None and dim not in SUPPORTED_DIMS:
+            raise ValueError(
+                f"Unsupported dim {dim}. Supported: {list(SUPPORTED_DIMS)}."
+            )
+        search_dim = dim if dim in SUPPORTED_DIMS else self._default_dim
+        column = _vector_column_for_dim(search_dim)
+        query_embedding = get_embedder(search_dim).embed(query)
 
-        Returns rows ordered by a weighted blend of ts_rank (text) and
-        1 - cosine distance (vector). The live column is read at startup
-        and cached on the client.
-
-        For pre-cutover mixed tables (some rows in v2, some in v1), we
-        run two passes: v2 with full hybrid scoring, then v1 with FTS
-        only. Results are merged with v2 taking priority.
-        """
         where_clauses = ["is_active = TRUE"]
         params: List[Any] = []
         if target:
@@ -466,100 +403,10 @@ class _PostgresClient:
                     params.append(row[0])
         where_sql = " AND ".join(where_clauses)
 
-        text_weight = _env_float(
-            "HERMES_POSTGRES_HYBRID_TEXT_WEIGHT", _HYBRID_TEXT_WEIGHT,
-        )
+        text_weight = _env_float("HERMES_POSTGRES_HYBRID_TEXT_WEIGHT", _HYBRID_TEXT_WEIGHT)
         vector_weight = 1.0 - text_weight
         fts_window = max(top_k * _FTS_WINDOW_OVERFETCH, _FTS_WINDOW_MIN)
 
-        with self._cursor() as cur:
-            # If the live column is v1 at 1024-dim (the legacy destructive
-            # migration case), use hybrid on that column directly. Otherwise
-            # run the v2-hybrid + v1-FTS-fallback pair.
-            live_col_name = _live_column_name(self._live_column)
-            live_is_v1_named = (live_col_name == _VV1_COLUMN
-                                and self._live_column == "v2_named_v1")
-
-            if live_is_v1_named:
-                # The legacy column is at 1024-dim, so we can run hybrid on it.
-                embedding = get_embedder().embed(query)
-                sql, sql_params = self._build_hybrid_sql(
-                    column=_VV1_COLUMN,
-                    query=query,
-                    where_sql=where_sql,
-                    where_params=list(params),
-                    query_embedding=embedding,
-                    fts_window=fts_window,
-                    top_k=top_k,
-                    text_weight=text_weight,
-                    vector_weight=vector_weight,
-                )
-                cur.execute(sql, sql_params)
-                return self._rows_to_dicts(cur.fetchall())[:top_k]
-
-            results: List[Dict] = []
-
-            # Pass 1: v2 (1024-dim) — full hybrid if the live column is v2.
-            # Even if the live column is v1, we still query v2 because
-            # some rows may have been backfilled.
-            v2_query_embedding = get_embedder().embed(query)
-            v2_sql, v2_params = self._build_hybrid_sql(
-                column=_V2_COLUMN,
-                query=query,
-                where_sql=where_sql,
-                where_params=list(params),
-                query_embedding=v2_query_embedding,
-                fts_window=fts_window,
-                top_k=top_k,
-                text_weight=text_weight,
-                vector_weight=vector_weight,
-            )
-            cur.execute(v2_sql, v2_params)
-            v2_rows = cur.fetchall()
-            results.extend(self._rows_to_dicts(v2_rows))
-
-            # If we're in v2-only mode, we're done.
-            if self._live_column == "v2":
-                return results[:top_k]
-
-            # Pass 2: v1 (1536-dim). FTS only, no vector similarity
-            # (the live embedder returns 1024-dim, which is dim-mismatched
-            # against v1 and would corrupt the cosine score).
-            v1_sql, v1_params = self._build_fts_only_sql(
-                column=_VV1_COLUMN,
-                query=query,
-                where_sql=where_sql,
-                where_params=list(params),
-                fts_window=fts_window,
-                top_k=top_k,
-            )
-            cur.execute(v1_sql, v1_params)
-            v1_rows = cur.fetchall()
-            v1_dicts = self._rows_to_dicts(v1_rows)
-            # Merge: v2 first (already ranked), then v1 deduped by id.
-            seen_ids = {r["id"] for r in results}
-            for r in v1_dicts:
-                if r["id"] not in seen_ids:
-                    results.append(r)
-            return results[:top_k]
-
-    def _build_hybrid_sql(
-        self,
-        *,
-        column: str,
-        query: str,
-        where_sql: str,
-        where_params: list,
-        query_embedding: list,
-        fts_window: int,
-        top_k: int,
-        text_weight: float,
-        vector_weight: float,
-    ) -> tuple[str, list]:
-        """Build the hybrid-search SQL for a given column. Returns
-        (sql, params). The params list is the exact ordering the SQL
-        expects; tests should assert on the length of this list to
-        catch placeholder/param drift."""
         sql = f"""
             WITH fts_candidates AS (
                 SELECT
@@ -586,59 +433,15 @@ class _PostgresClient:
             ORDER BY hybrid_score DESC
             LIMIT %s
         """
-        # Param ordering: where_params (target/category), then ts_rank,
-        # then tsquery, then LIMIT, then vector_sim, then hybrid, then
-        # outer LIMIT. The order MUST match the placeholder order above.
-        params = list(where_params) + [
-            query, query, fts_window,
-            query_embedding, query_embedding, top_k,
-        ]
-        return sql, params
+        sql_params = list(params) + [query, query, fts_window,
+                                     query_embedding, query_embedding, top_k]
 
-    def _build_fts_only_sql(
-        self,
-        *,
-        column: str,
-        query: str,
-        where_sql: str,
-        where_params: list,
-        fts_window: int,
-        top_k: int,
-    ) -> tuple[str, list]:
-        """Build an FTS-only SQL for the v1 column. Used during the
-        pre-cutover period when some rows are still in v1 and we don't
-        have a matching 1536-dim embedder to compute cosine similarity."""
-        sql = f"""
-            WITH fts_candidates AS (
-                SELECT
-                    m.id, m.target, m.content, m.created_at, m.tags, m.metadata,
-                    m.{column} AS content_vector,
-                    ts_rank(to_tsvector('english', m.content),
-                            plainto_tsquery('english', %s)) AS text_rank
-                FROM agent_memory m
-                WHERE {where_sql}
-                  AND m.{column} IS NOT NULL
-                  AND to_tsvector('english', m.content) @@
-                      plainto_tsquery('english', %s)
-                ORDER BY text_rank DESC
-                LIMIT %s
-            )
-            SELECT
-                id, target, content, created_at, tags, metadata,
-                text_rank,
-                NULL::float AS vector_sim,
-                text_rank AS hybrid_score
-            FROM fts_candidates
-            ORDER BY hybrid_score DESC
-            LIMIT %s
-        """
-        params = list(where_params) + [query, query, fts_window, top_k]
-        return sql, params
+        with self._cursor() as cur:
+            cur.execute(sql, sql_params)
+            rows = cur.fetchall()
 
-    def _rows_to_dicts(self, rows) -> List[Dict]:
-        out = []
-        for r in rows:
-            out.append({
+        return [
+            {
                 "id": str(r[0]),
                 "target": r[1],
                 "content": r[2],
@@ -648,8 +451,9 @@ class _PostgresClient:
                 "text_rank": float(r[6]) if r[6] is not None else 0.0,
                 "vector_sim": float(r[7]) if r[7] is not None else None,
                 "rank": float(r[8]) if r[8] is not None else 0.0,
-            })
-        return out
+            }
+            for r in rows
+        ]
 
     def get_recent_memories(self, target: Optional[str] = None, limit: int = 20) -> List[Dict]:
         with self._cursor() as cur:
@@ -659,8 +463,7 @@ class _PostgresClient:
                     SELECT id, target, content, created_at, tags, metadata
                     FROM agent_memory
                     WHERE is_active = TRUE AND target = %s
-                    ORDER BY created_at DESC
-                    LIMIT %s
+                    ORDER BY created_at DESC LIMIT %s
                     """,
                     (target, limit),
                 )
@@ -668,15 +471,12 @@ class _PostgresClient:
                 cur.execute(
                     """
                     SELECT id, target, content, created_at, tags, metadata
-                    FROM agent_memory
-                    WHERE is_active = TRUE
-                    ORDER BY created_at DESC
-                    LIMIT %s
+                    FROM agent_memory WHERE is_active = TRUE
+                    ORDER BY created_at DESC LIMIT %s
                     """,
                     (limit,),
                 )
             rows = cur.fetchall()
-
         return [
             {
                 "id": str(r[0]),
@@ -698,8 +498,8 @@ class _PostgresClient:
             return cur.rowcount > 0
 
     def update_memory(self, memory_id: str, content: str) -> bool:
-        column = _live_column_name(self._live_column)
-        embedding = get_embedder().embed(content)
+        column = _vector_column_for_dim(self._default_dim)
+        embedding = get_embedder(self._default_dim).embed(content)
         with self._cursor() as cur:
             cur.execute(
                 f"UPDATE agent_memory SET content = %s, {column} = %s::vector, "
@@ -718,6 +518,21 @@ class _PostgresClient:
             else:
                 cur.execute("SELECT COUNT(*) FROM agent_memory WHERE is_active = TRUE")
             return cur.fetchone()[0]
+
+    def count_by_dim(self) -> Dict[int, int]:
+        """Count non-null rows per dim column. Useful for status / preflight."""
+        out: Dict[int, int] = {}
+        with self._cursor() as cur:
+            for d in SUPPORTED_DIMS:
+                col = _vector_column_for_dim(d)
+                cur.execute(
+                    f"SELECT COUNT(*) FROM agent_memory "
+                    f"WHERE is_active = TRUE AND {col} IS NOT NULL "
+                    f"AND {col} <> array_fill(0, ARRAY[%s])::vector",
+                    (d,),
+                )
+                out[d] = cur.fetchone()[0]
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -777,6 +592,11 @@ SEARCH_SCHEMA = {
                          "tool_quirk", "lesson_learned", "workflow", "fact"],
                 "description": "Filter by category (optional).",
             },
+            "dim": {
+                "type": "integer",
+                "enum": [768, 1024, 1536],
+                "description": "Override the default embedding dim for this search (default: configured default).",
+            },
             "top_k": {"type": "integer", "description": "Max results (default: 10, max: 50)."},
         },
         "required": ["query"],
@@ -789,11 +609,8 @@ RECENT_SCHEMA = {
     "parameters": {
         "type": "object",
         "properties": {
-            "target": {
-                "type": "string",
-                "enum": ["memory", "user"],
-                "description": "Filter by target store (optional).",
-            },
+            "target": {"type": "string", "enum": ["memory", "user"],
+                       "description": "Filter by target store (optional)."},
             "limit": {"type": "integer", "description": "Max results (default: 20, max: 100)."},
         },
         "required": [],
@@ -814,8 +631,25 @@ FORGET_SCHEMA = {
 
 STATUS_SCHEMA = {
     "name": "pg_status",
-    "description": "Check PostgreSQL memory store status — connection, table stats, pgvector version, live column, embedder health.",
+    "description": "Check PostgreSQL memory store status — connection, table stats, default dim, per-dim embedding coverage, embedder health.",
     "parameters": {"type": "object", "properties": {}, "required": []},
+}
+
+MODEL_SET_SCHEMA = {
+    "name": "pg_model_set",
+    "description": "Switch the default embedding dim and/or model. After this, new writes go to the configured dim, and the embedder is reconfigured. Existing rows are untouched; run `hermes postgres-memory backfill --dim <dim>` to populate the new dim for them.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "dim": {"type": "integer", "enum": [768, 1024, 1536],
+                    "description": "The new default dim. 768=nomic-embed-text (Ollama), 1024=bge-m3 (Kimi), 1536=OpenAI text-embedding-3-small."},
+            "provider": {"type": "string",
+                         "description": "Override the provider for this dim. Defaults to the SQL-registered value."},
+            "model": {"type": "string",
+                      "description": "Override the model name for this dim."},
+        },
+        "required": ["dim"],
+    },
 }
 
 
@@ -829,16 +663,12 @@ class PostgresMemoryProvider(MemoryProvider):
     def __init__(self):
         self._client: Optional[_PostgresClient] = None
         self._session_id = ""
-        # Per-process lock only around _client init (which warms the
-        # connection pool and reads live column). All other operations
-        # go through the pool's own thread-safety.
 
     @property
     def name(self) -> str:
         return "postgres"
 
     def is_available(self) -> bool:
-        """Check if PostgreSQL is reachable and pgvector is installed."""
         try:
             client = _PostgresClient()
             with client._cursor() as cur:
@@ -852,73 +682,13 @@ class PostgresMemoryProvider(MemoryProvider):
 
     def get_config_schema(self) -> List[Dict[str, Any]]:
         return [
-            {
-                "key": "host",
-                "description": "PostgreSQL host",
-                "default": "localhost",
-                "env_var": "POSTGRES_HOST",
-            },
-            {
-                "key": "port",
-                "description": "PostgreSQL port",
-                "default": "5432",
-                "env_var": "POSTGRES_PORT",
-            },
-            {
-                "key": "user",
-                "description": "PostgreSQL user",
-                "default": "hermes",
-                "env_var": "POSTGRES_USER",
-            },
-            {
-                "key": "password",
-                "description": "PostgreSQL password",
-                "secret": True,
-                "required": True,
-                "env_var": "POSTGRES_PASSWORD",
-            },
-            {
-                "key": "database",
-                "description": "PostgreSQL database name",
-                "default": "hermes",
-                "env_var": "POSTGRES_DATABASE",
-            },
-            {
-                "key": "embed_provider",
-                "description": "Embedding provider: kimi, ollama_cloud, ollama_local, or noop",
-                "default": "kimi",
-                "env_var": "HERMES_EMBED_PROVIDER",
-            },
-            {
-                "key": "embed_model",
-                "description": "Embedding model name (default: bge_m3_embed for kimi)",
-                "default": "bge_m3_embed",
-                "env_var": "HERMES_EMBED_MODEL",
-            },
-            {
-                "key": "embed_dim",
-                "description": "Embedding output dim; must match the live vector column",
-                "default": "1024",
-                "env_var": "HERMES_EMBED_DIM",
-            },
-            {
-                "key": "embed_base_url",
-                "description": "Embedding provider API base URL (leave blank for provider default)",
-                "default": "",
-                "env_var": "HERMES_EMBED_BASE_URL",
-            },
-            {
-                "key": "embed_api_key",
-                "description": "Embedding provider API key (falls back to KIMI_API_KEY / OLLAMA_API_KEY)",
-                "secret": True,
-                "env_var": "HERMES_EMBED_API_KEY",
-            },
-            {
-                "key": "embed_fail_open",
-                "description": "Fall back to zero vector on provider errors (1=yes, 0=raise)",
-                "default": "1",
-                "env_var": "HERMES_EMBED_FAIL_OPEN",
-            },
+            {"key": "host", "description": "PostgreSQL host", "default": "localhost", "env_var": "POSTGRES_HOST"},
+            {"key": "port", "description": "PostgreSQL port", "default": "5432", "env_var": "POSTGRES_PORT"},
+            {"key": "user", "description": "PostgreSQL user", "default": "hermes", "env_var": "POSTGRES_USER"},
+            {"key": "password", "description": "PostgreSQL password", "secret": True, "required": True, "env_var": "POSTGRES_PASSWORD"},
+            {"key": "database", "description": "PostgreSQL database name", "default": "hermes", "env_var": "POSTGRES_DATABASE"},
+            {"key": "default_dim", "description": "Default embedding dim (768/1024/1536)",
+             "default": "1024", "env_var": "HERMES_EMBED_DEFAULT_DIM"},
         ]
 
     def initialize(self, session_id: str, **kwargs) -> None:
@@ -931,26 +701,19 @@ class PostgresMemoryProvider(MemoryProvider):
             return ""
         try:
             count = self._client.count_memories()
-            live = self._client.live_column
+            d = self._client.default_dim
             return (
                 f"# PostgreSQL Vector Memory\n"
                 f"Active. {count} memories stored. pgvector with HNSW index, full-text search, hybrid retrieval.\n"
-                f"Live vector column: {live} (1024-dim BGE-M3 family).\n"
-                f"Use pg_remember to store facts, pg_search to recall, pg_recent to browse, pg_forget to remove, pg_status for diagnostics."
+                f"Default embedding dim: {d}. Per-dim vector columns supported: 768, 1024, 1536.\n"
+                f"Use pg_remember to store facts, pg_search to recall, pg_recent to browse, "
+                f"pg_forget to remove, pg_status for diagnostics, pg_model_set to switch dim."
             )
         except Exception as e:
             logger.warning("Postgres system_prompt_block failed: %s", e)
-            return "# PostgreSQL Vector Memory\nActive. Use pg_remember, pg_search, pg_recent, pg_forget, pg_status."
+            return "# PostgreSQL Vector Memory\nActive. Use pg_remember, pg_search, pg_recent, pg_forget, pg_status, pg_model_set."
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
-        """Recall relevant memories before each turn.
-
-        This makes a live embed call on every turn. The content-
-        addressable cache makes repeat queries free after the first
-        call, but the first call has ~500ms latency on Kimi. Hermes
-        may rate-limit short queries; we set a 5-character minimum
-        to skip empty / short inputs.
-        """
         if not self._client or not query or len(query.strip()) < 5:
             return ""
         try:
@@ -970,16 +733,15 @@ class PostgresMemoryProvider(MemoryProvider):
         pass
 
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
-        """No automatic turn sync — explicit pg_remember only."""
         pass
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        return [REMEMBER_SCHEMA, SEARCH_SCHEMA, RECENT_SCHEMA, FORGET_SCHEMA, STATUS_SCHEMA]
+        return [REMEMBER_SCHEMA, SEARCH_SCHEMA, RECENT_SCHEMA, FORGET_SCHEMA,
+                STATUS_SCHEMA, MODEL_SET_SCHEMA]
 
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
         if not self._client:
             return tool_error("PostgreSQL memory provider not initialized")
-
         try:
             if tool_name == "pg_remember":
                 return self._tool_remember(args)
@@ -991,21 +753,20 @@ class PostgresMemoryProvider(MemoryProvider):
                 return self._tool_forget(args)
             elif tool_name == "pg_status":
                 return self._tool_status()
+            elif tool_name == "pg_model_set":
+                return self._tool_model_set(args)
             return tool_error(f"Unknown tool: {tool_name}")
         except Exception as e:
             logger.error("Postgres tool %s failed: %s", tool_name, e)
             return tool_error(f"PostgreSQL tool '{tool_name}' failed: {e}")
 
     def on_memory_write(self, action: str, target: str, content: str, metadata: Optional[Dict] = None) -> None:
-        """Mirror built-in memory writes to PostgreSQL."""
         if action not in {"add", "replace"} or not content or not self._client:
             return
         try:
             category = "user_profile" if target == "user" else "fact"
             self._client.add_memory(
-                content=content,
-                category=category,
-                target=target,
+                content=content, category=category, target=target,
                 tags=["mirrored", "builtin"],
                 metadata={"source": "builtin_memory_tool", "action": action, **(metadata or {})},
             )
@@ -1021,67 +782,49 @@ class PostgresMemoryProvider(MemoryProvider):
         content = args.get("content", "").strip()
         if not content:
             return tool_error("content is required")
-
-        category = args.get("category", "fact")
-        target = args.get("target", "memory")
-        tags = args.get("tags", [])
-
         memory_id = self._client.add_memory(
             content=content,
-            category=category,
-            target=target,
-            tags=tags,
+            category=args.get("category", "fact"),
+            target=args.get("target", "memory"),
+            tags=args.get("tags", []),
         )
-        return json.dumps({
-            "success": True,
-            "memory_id": memory_id,
-            "message": "Memory stored in PostgreSQL.",
-        })
+        return json.dumps({"success": True, "memory_id": memory_id,
+                           "message": "Memory stored in PostgreSQL."})
 
     def _tool_search(self, args: Dict[str, Any]) -> str:
         query = args.get("query", "").strip()
         if not query:
             return tool_error("query is required")
-
-        target = args.get("target")
-        category = args.get("category")
-        top_k = min(args.get("top_k", 10), 50)
-
-        results = self._client.search_memories(query, target=target, category=category, top_k=top_k)
+        results = self._client.search_memories(
+            query,
+            target=args.get("target"),
+            category=args.get("category"),
+            dim=args.get("dim"),
+            top_k=min(args.get("top_k", 10), 50),
+        )
         if not results:
             return json.dumps({"results": [], "message": "No matching memories found."})
-
-        return json.dumps({
-            "results": results,
-            "count": len(results),
-        })
+        return json.dumps({"results": results, "count": len(results)})
 
     def _tool_recent(self, args: Dict[str, Any]) -> str:
-        target = args.get("target")
-        limit = min(args.get("limit", 20), 100)
-
-        results = self._client.get_recent_memories(target=target, limit=limit)
-        return json.dumps({
-            "results": results,
-            "count": len(results),
-        })
+        results = self._client.get_recent_memories(
+            target=args.get("target"),
+            limit=min(args.get("limit", 20), 100),
+        )
+        return json.dumps({"results": results, "count": len(results)})
 
     def _tool_forget(self, args: Dict[str, Any]) -> str:
         memory_id = args.get("memory_id", "").strip()
         if not memory_id:
             return tool_error("memory_id is required")
-
         success = self._client.remove_memory(memory_id)
-        return json.dumps({
-            "success": success,
-            "message": "Memory deleted." if success else "Memory not found.",
-        })
+        return json.dumps({"success": success,
+                           "message": "Memory deleted." if success else "Memory not found."})
 
     def _tool_status(self) -> str:
         host = os.environ.get("POSTGRES_HOST", "localhost")
         port = os.environ.get("POSTGRES_PORT", "5432")
         database = os.environ.get("POSTGRES_DATABASE", "hermes")
-
         with self._client._cursor() as cur:
             cur.execute("SELECT version()")
             version = cur.fetchone()[0]
@@ -1090,31 +833,21 @@ class PostgresMemoryProvider(MemoryProvider):
             cur.execute("SELECT COUNT(*) FROM agent_memory WHERE is_active = TRUE")
             total = cur.fetchone()[0]
             cur.execute(
-                "SELECT name, COUNT(*) FROM agent_memory JOIN memory_categories ON agent_memory.category_id = memory_categories.id WHERE is_active = TRUE GROUP BY name"
+                "SELECT name, COUNT(*) FROM agent_memory JOIN memory_categories "
+                "ON agent_memory.category_id = memory_categories.id "
+                "WHERE is_active = TRUE GROUP BY name"
             )
             by_category = {r[0]: r[1] for r in cur.fetchall()}
-
-            # Zero-vec count is per the live column, with fallback to v1.
-            live = self._client.live_column
-            zero_col = _live_column_name(live)
-            cur.execute(
-                "SELECT count(*) FROM agent_memory "
-                "WHERE is_active = TRUE "
-                f"AND {zero_col} = array_fill(0, ARRAY[1024])::vector",
-            )
-            zero_vec_count = cur.fetchone()[0]
-
-        try:
-            embedder = get_embedder()
-            embedder_info = {
-                "provider": embedder.provider,
-                "model": embedder.model,
-                "dim": embedder.dim,
-                "stats": embedder.stats(),
-            }
-        except Exception as exc:
-            embedder_info = {"error": str(exc)}
-
+        per_dim = self._client.count_by_dim()
+        embedder_info: Dict[str, Any] = {}
+        for d in SUPPORTED_DIMS:
+            try:
+                e = get_embedder(d)
+                embedder_info[str(d)] = {
+                    "provider": e.provider, "model": e.model, "stats": e.stats(),
+                }
+            except Exception as exc:
+                embedder_info[str(d)] = {"error": str(exc)}
         return json.dumps({
             "status": "connected",
             "host": f"{host}:{port}/{database}",
@@ -1122,9 +855,64 @@ class PostgresMemoryProvider(MemoryProvider):
             "pgvector_version": vector_ver[0] if vector_ver else "not installed",
             "total_memories": total,
             "by_category": by_category,
-            "live_vector_column": live,
-            "zero_vector_memories": zero_vec_count,
-            "embedder": embedder_info,
+            "default_dim": self._client.default_dim,
+            "per_dim_embedded": per_dim,
+            "embedders": embedder_info,
+        })
+
+    def _tool_model_set(self, args: Dict[str, Any]) -> str:
+        """Switch the default dim, optionally override the model for that dim."""
+        dim = args.get("dim")
+        if dim not in SUPPORTED_DIMS:
+            return tool_error(f"dim must be one of {list(SUPPORTED_DIMS)}")
+        provider = args.get("provider")
+        model = args.get("model")
+        # 1) Update the model registry row for this dim
+        with self._client._cursor() as cur:
+            if provider or model:
+                cur.execute(
+                    "UPDATE agent_memory_models SET "
+                    "  provider = COALESCE(%s, provider), "
+                    "  model = COALESCE(%s, model), "
+                    "  updated_at = now() "
+                    "WHERE dim = %s RETURNING provider, model",
+                    (provider, model, dim),
+                )
+                row = cur.fetchone()
+                if not row:
+                    # No row for this dim — insert with the overrides or defaults
+                    cur.execute(
+                        "INSERT INTO agent_memory_models (dim, provider, model, api_key_env) "
+                        "VALUES (%s, %s, %s, %s) "
+                        "ON CONFLICT (dim) DO UPDATE SET "
+                        "  provider = EXCLUDED.provider, model = EXCLUDED.model, "
+                        "  updated_at = now() "
+                        "RETURNING provider, model",
+                        (dim, provider or "kimi", model or "bge_m3_embed", "KIMI_API_KEY"),
+                    )
+                    row = cur.fetchone()
+                provider, model = row
+            # 2) Update default_dim
+            cur.execute(
+                "UPDATE agent_memory_settings SET value = %s::jsonb, updated_at = now() "
+                "WHERE key = 'default_dim' "
+                "RETURNING value",
+                (str(dim),),
+            )
+            row = cur.fetchone()
+        # 3) Reset the per-dim embedder singleton so the next call picks up new config
+        reset_embedder(dim)
+        new_dim = self._client.refresh_default_dim()
+        return json.dumps({
+            "success": True,
+            "new_default_dim": new_dim,
+            "model_for_dim": {"dim": dim, "provider": provider, "model": model},
+            "message": (
+                f"Default dim is now {new_dim}. "
+                f"New writes go to vector_{new_dim}. "
+                f"Run `hermes postgres-memory backfill --dim {new_dim}` "
+                f"to populate the new dim for existing rows."
+            ),
         })
 
 

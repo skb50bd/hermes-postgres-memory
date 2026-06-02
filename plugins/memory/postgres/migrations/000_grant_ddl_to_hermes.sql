@@ -2,7 +2,7 @@
 --
 -- Reassign ownership of agent_memory from `postgres` (or whoever the
 -- current owner is) to `hermes` so the hermes role can perform DDL
--- on the table — needed for the sidecar-column migration in 001.
+-- on the table — needed for the migration in 001.
 --
 -- Run as a superuser (e.g. psql -U postgres -d hermes) ONCE.
 --
@@ -13,13 +13,6 @@
 --   SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER, MAINTAIN
 -- (verified via aclexplode on the table's relacl). For DDL, ownership
 -- is the only path. This file transfers ownership atomically.
---
--- Security note
--- -------------
--- After this, hermes can ALTER, DROP, TRUNCATE, or rename the table.
--- This is the simplest path forward. If you prefer to keep hermes at
--- DML-only for production, use a SECURITY DEFINER function instead
--- (out of scope here) or perform future migrations manually.
 --
 -- This file is idempotent: re-running is a no-op.
 

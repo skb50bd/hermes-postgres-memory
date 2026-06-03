@@ -159,15 +159,38 @@ For CLI-only use, start a fresh `hermes` process instead.
 
 ### 5. Verify before claiming success
 
-Run all of these:
+First inspect the live CLI shape. Current Hermes builds may register this plugin
+as the top-level `hermes postgres` command while not exposing nested
+`postgres-memory` subcommands. Do not assume the CLI verifier commands exist.
+
+```bash
+hermes --help | grep -E 'postgres|postgres-memory' || true
+hermes postgres --help || true
+hermes postgres-memory --help || true
+```
+
+Run repository/database verification:
 
 ```bash
 cd ~/repos/hermes-postgres-memory
 ./plugins/memory/postgres/scripts/diagnose.sh
+```
+
+If `diagnose.sh` fails only because it checks the profile path while the plugin
+is installed in Hermes' install tree, patch the path check or fall back to the
+SQL probes in "Direct database verification" below. Do not block the migration
+on the cosmetic path check if direct DB checks and pg tools pass.
+
+If this build exposes working CLI subcommands, also run them:
+
+```bash
 hermes postgres-memory preflight
 hermes postgres-memory status
 hermes postgres-memory model-list
 ```
+
+If `hermes postgres-memory` is not registered, skip those CLI commands and use
+`pg_status`, `pg_remember`, and `pg_search` as the authoritative smoke test.
 
 Expected high-level result:
 
@@ -273,10 +296,15 @@ villain.
 ### 4. Re-run verification
 
 ```bash
-hermes postgres-memory preflight
-hermes postgres-memory status
-hermes postgres-memory model-list
+hermes postgres-memory preflight || true
+hermes postgres-memory status || true
+hermes postgres-memory model-list || true
 ```
+
+If `postgres-memory` is not a registered command in the installed Hermes build,
+use the direct SQL probes plus `pg_status`, `pg_remember`, and `pg_search`
+instead. A top-level `hermes postgres` command with no nested subcommands is a
+known registration shape in some builds.
 
 Then smoke test with `pg_remember` and `pg_search`.
 
@@ -304,22 +332,32 @@ Interpretation:
 
 ## Model and dimension operations
 
-Show current model registry:
+Show current model registry if the CLI subcommand exists:
 
 ```bash
-hermes postgres-memory model-list
+hermes postgres-memory model-list || true
 ```
 
-Set default dimension:
+If `postgres-memory` is not registered in the installed Hermes build, inspect
+`agent_memory_models` directly with SQL instead:
 
 ```bash
-hermes postgres-memory model-set --dim 1024
+psql "$PG_MEM_DB_CONN_STR" -tAc "SELECT dim, provider, model, is_default FROM agent_memory_models ORDER BY dim;"
 ```
 
-Set explicit provider/model:
+Set default dimension if the CLI subcommand exists:
 
 ```bash
-hermes postgres-memory model-set --dim 1024 --provider kimi --model bge_m3_embed
+hermes postgres-memory model-set --dim 1024 || true
+```
+
+Without working CLI subcommands, set the default via SQL only when the user
+explicitly asks to change it; otherwise leave the current registry alone.
+
+Set explicit provider/model if the CLI subcommand exists:
+
+```bash
+hermes postgres-memory model-set --dim 1024 --provider kimi --model bge_m3_embed || true
 ```
 
 Backfill missing embeddings:

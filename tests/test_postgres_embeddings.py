@@ -61,11 +61,12 @@ def pg_module(monkeypatch, tmp_path_factory):
     for m in list(sys.modules):
         if m == "embedder" or m.startswith("plugins.memory.postgres"):
             del sys.modules[m]
-    monkeypatch.setenv("POSTGRES_HOST", "db")
-    monkeypatch.setenv("POSTGRES_PORT", "5432")
-    monkeypatch.setenv("POSTGRES_USER", "hermes")
-    monkeypatch.setenv("POSTGRES_PASSWORD", "secret")
-    monkeypatch.setenv("POSTGRES_DATABASE", "hermes")
+    monkeypatch.setenv("PG_MEM_DB_CONN_STR", "postgresql://hermes:***@db:5432/hermes")
+    monkeypatch.delenv("POSTGRES_HOST", raising=False)
+    monkeypatch.delenv("POSTGRES_PORT", raising=False)
+    monkeypatch.delenv("POSTGRES_USER", raising=False)
+    monkeypatch.delenv("POSTGRES_PASSWORD", raising=False)
+    monkeypatch.delenv("POSTGRES_DATABASE", raising=False)
     monkeypatch.setenv("HERMES_EMBED_PROVIDER_768", "ollama_local")
     monkeypatch.setenv("HERMES_EMBED_PROVIDER_1024", "kimi")
     monkeypatch.setenv("HERMES_EMBED_PROVIDER_1536", "kimi")

@@ -125,12 +125,10 @@ cat <<EOF
 Next steps:
 
   1. Make sure ~/.hermes/.env has these (add if missing):
-       POSTGRES_HOST=<host>
-       POSTGRES_PORT=5432
-       POSTGRES_USER=hermes
-       POSTGRES_PASSWORD=***
-       POSTGRES_DATABASE=hermes
+       PG_MEM_DB_CONN_STR='postgresql://hermes:***@10.0.0.1:5432/hermes'
        KIMI_API_KEY=***   # https://platform.moonshot.cn
+       # (the legacy POSTGRES_HOST/PORT/USER/PASSWORD/DATABASE vars are
+       #  still accepted as of v1.5.0 but deprecated; will be removed in v2.0)
 
   2. Make sure the database is set up. If you haven't done that yet,
      run the one-shot installer from the repo root:

@@ -21,8 +21,9 @@ Usage:
     python scripts/verify_embeddings.py --dim 1024            # non-default model
 
 Environment:
+    PG_MEM_DB_CONN_STR (preferred) — postgresql:// DSN, same as the memory plugin.
     POSTGRES_HOST, POSTGRES_PORT, POSTGRES_USER, POSTGRES_PASSWORD,
-    POSTGRES_DATABASE — required, same as the memory plugin.
+    POSTGRES_DATABASE — legacy fallback (deprecated as of v1.5.0).
     HERMES_EMBED_DIM — defaults to 768, override if your model is different.
     HERMES_EMBED_FAIL_OPEN — should be 1; verify-passing under 0 is stricter.
 """
@@ -61,14 +62,22 @@ except ImportError:
 
 
 def _connect():
+    """Build a psycopg2 connection from PG_MEM_DB_CONN_STR (preferred)
+    or the legacy POSTGRES_* vars. Mirrors the plugin's resolver."""
+    from psycopg2.extensions import make_dsn
+
+    dsn = os.environ.get("PG_MEM_DB_CONN_STR", "").strip()
+    if not dsn:
+        from urllib.parse import quote
+        dsn = (
+            f"postgresql://{quote(os.environ['POSTGRES_USER'], safe='')}:"
+            f"***@"
+            f"{os.environ.get('POSTGRES_HOST', 'localhost')}:"
+            f"{os.environ.get('POSTGRES_PORT', '5432')}/"
+            f"{os.environ.get('POSTGRES_DATABASE', 'hermes')}"
+        )
     return psycopg2.connect(
-        host=os.environ.get("POSTGRES_HOST", "localhost"),
-        port=int(os.environ.get("POSTGRES_PORT", "5432")),
-        user=os.environ.get("POSTGRES_USER", "hermes"),
-        password=os.environ["POSTGRES_PASSWORD"],
-        dbname=os.environ.get("POSTGRES_DATABASE", "hermes"),
-        connect_timeout=5,
-        application_name="hermes-memory-verify",
+        make_dsn(dsn=dsn, connect_timeout=5, application_name="hermes-memory-verify"),
     )
 
 

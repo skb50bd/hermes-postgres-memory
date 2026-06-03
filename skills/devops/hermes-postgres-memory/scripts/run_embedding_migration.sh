@@ -43,14 +43,20 @@ if [ -f ~/.hermes/.env ]; then
   set -a; source ~/.hermes/.env; set +a
 fi
 
-: "${POSTGRES_HOST:?POSTGRES_HOST not set}"
-: "${POSTGRES_PORT:=5432}"
-: "${POSTGRES_USER:=hermes}"
-: "${POSTGRES_DATABASE:=hermes}"
-: "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD not set}"
-export PGPASSWORD="$POSTGRES_PASSWORD"
-PSQL=(psql -h "$POSTGRES_HOST" -p "$POSTGRES_PORT" -U "$POSTGRES_USER" \
-      -d "$POSTGRES_DATABASE" -v ON_ERROR_STOP=1 -X -q)
+# Prefer PG_MEM_DB_CONN_STR (v1.5.0+). Fall back to building a DSN from the
+# legacy POSTGRES_* vars when the new form is unset.
+if [ -n "${PG_MEM_DB_CONN_STR:-}" ]; then
+  PSQL=(psql "$PG_MEM_DB_CONN_STR" -v ON_ERROR_STOP=1 -X -q)
+else
+  : "${POSTGRES_HOST:?POSTGRES_HOST not set}"
+  : "${POSTGRES_PORT:=5432}"
+  : "${POSTGRES_USER:=hermes}"
+  : "${POSTGRES_DATABASE:=hermes}"
+  : "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD not set}"
+  export PGPASSWORD="$POSTGRES_PASSWORD"
+  PSQL=(psql -h "$POSTGRES_HOST" -p "$POSTGRES_PORT" -U "$POSTGRES_USER" \
+        -d "$POSTGRES_DATABASE" -v ON_ERROR_STOP=1 -X -q)
+fi
 
 SKIP_MIGRATION=0
 SKIP_BACKFILL=0

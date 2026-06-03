@@ -88,16 +88,12 @@ cd /tmp/hpm
 ```
 
 Or non-interactive, for scripted onboarding:
+Or non-interactive, for scripted onboarding:
 
 ```bash
-export POSTGRES_HOST=10.49.0.33
-export POSTGRES_PORT=5432
+export PG_MEM_DB_CONN_STR='postgresql://hermes:***@10.49.0.33:5432/hermes'
 export POSTGRES_SUPERUSER=postgres
-export POSTGRES_SUPERUSER_PASSWORD=***
-export NEW_DB_NAME=hermes
-export NEW_ROLE_NAME=hermes
-export NEW_ROLE_PASSWORD=***
-./plugins/memory/postgres/scripts/bootstrap.sh --non-interactive
+export POSTGRES_SUPERUSER_PASSWORD=***./plugins/memory/postgres/scripts/bootstrap.sh --non-interactive
 ```
 
 The script will:
@@ -107,7 +103,7 @@ The script will:
 3. Install the `pgvector` extension
 4. Run the plugin's `000_schema.sql` to create `agent_memory` etc.
 5. Install the plugin + skill into `~/.hermes/hermes-agent/`
-6. Append the `POSTGRES_*` block to `~/.hermes/.env`
+6. Append the `PG_MEM_DB_CONN_STR` block to `~/.hermes/.env`
 7. Set `memory.provider: postgres` in `~/.hermes/config.yaml`
 8. Run the diagnose script and print the final report
 
@@ -221,9 +217,9 @@ has a reference doc explaining the privilege dance.
 | Symptom | Fix |
 |---|---|
 | `diagnose.sh` says "psql not found" | Install `postgresql-client` |
-| `diagnose.sh` says "POSTGRES_* unset" | Edit `~/.hermes/.env` (the bootstrap script appends a block — verify it's there) |
+| `diagnose.sh` says "PG_MEM_DB_CONN_STR or POSTGRES_* unset" | Edit `~/.hermes/.env` (the bootstrap script appends a block — verify it's there) |
 | `diagnose.sh` says "pgvector not installed" | The `000_create_database_and_role.sql` script installs it. Re-run that script as superuser, or `apt install postgresql-15-pgvector` and re-run. |
-| `diagnose.sh` says "public schema owned by postgres" | `ALTER SCHEMA public OWNER TO $POSTGRES_USER;` as superuser |
+| `diagnose.sh` says "public schema owned by postgres" | `ALTER SCHEMA public OWNER TO $POSTGRES_USER;` as superuser (or `... OWNER TO hermes;` if you don't have `POSTGRES_USER` exported and you know the role name from `PG_MEM_DB_CONN_STR`) |
 | `bootstrap.sh` says "could not connect as postgres" | Wrong password, wrong port, or wrong host. Re-run with the correct superuser credentials. |
 | `hermes postgres-memory status` shows `per_dim_embedded` all 0 after a smoke test | Embedder is failing silently. Check `KIMI_API_KEY` is in the gateway's env. Try `HERMES_EMBED_FAIL_OPEN=0` to surface errors. |
 | `pg_search` returns nothing | The row may not have a vector at the configured dim yet. Backfill or switch dims with `model-set`. |
@@ -233,7 +229,7 @@ has a reference doc explaining the privilege dance.
 
 ## Files you'll touch
 
-- `~/.hermes/.env` — add `POSTGRES_*` and `KIMI_API_KEY` (bootstrap does this)
+- `~/.hermes/.env` — add `PG_MEM_DB_CONN_STR` and `KIMI_API_KEY` (bootstrap does this)
 - `~/.hermes/config.yaml` — set `memory.provider: postgres` (bootstrap does this)
 - `~/.hermes/hermes-agent/plugins/memory/postgres/` — plugin code
 - `~/.hermes/hermes-agent/skills/devops/hermes-postgres-memory/` — skill

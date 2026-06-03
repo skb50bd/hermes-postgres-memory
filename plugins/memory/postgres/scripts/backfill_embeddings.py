@@ -84,14 +84,24 @@ def _maybe_source_env() -> None:
 
 
 def _connect():
+    """Build a psycopg2 connection from PG_MEM_DB_CONN_STR (preferred)
+    or the legacy POSTGRES_* vars. The plugin's get_pg_mem_db_conn_str
+    helper handles both forms and emits a one-time deprecation warning
+    on legacy use. Will be removed in v2.0."""
+    import sys as _sys
+    from urllib.parse import quote
+    from psycopg2.extensions import make_dsn
+    _HERE = os.path.dirname(os.path.abspath(__file__))
+    if _HERE not in _sys.path:
+        _sys.path.insert(0, os.path.abspath(os.path.join(_HERE, "..", "..")))
+    from plugins.memory.postgres import get_pg_mem_db_conn_str
+    base = get_pg_mem_db_conn_str()
     return psycopg2.connect(
-        host=os.environ.get("POSTGRES_HOST", "localhost"),
-        port=int(os.environ.get("POSTGRES_PORT", "5432")),
-        user=os.environ.get("POSTGRES_USER", "hermes"),
-        password=os.environ["POSTGRES_PASSWORD"],
-        dbname=os.environ.get("POSTGRES_DATABASE", "hermes"),
-        connect_timeout=5,
-        application_name="hermes-memory-backfill",
+        make_dsn(
+            dsn=base,
+            connect_timeout=5,
+            application_name="hermes-memory-backfill",
+        )
     )
 
 

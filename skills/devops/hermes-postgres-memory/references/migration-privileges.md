@@ -36,8 +36,10 @@ The only paths to DDL on a table are:
 ## Symptoms
 
 ```
-$ psql -h $POSTGRES_HOST -U hermes -d $POSTGRES_DATABASE \
+$ psql "$PG_MEM_DB_CONN_STR" \
     -f plugins/memory/postgres/migrations/001_embedding_dim.sql
+# (Legacy: psql -h $POSTGRES_HOST -U hermes -d $POSTGRES_DATABASE -f ...
+#  The DSN form is preferred as of v1.5.0.)
 BEGIN
 DROP INDEX
 ERROR:  must be owner of table agent_memory
@@ -116,8 +118,9 @@ WHERE c.relname = 'agent_memory';
 ## Re-run the migration
 
 ```bash
-psql -h $POSTGRES_HOST -U $POSTGRES_USER -d $POSTGRES_DATABASE \
+psql "$PG_MEM_DB_CONN_STR" \
   -f plugins/memory/postgres/migrations/001_embedding_dim.sql
+# (Legacy: psql -h $POSTGRES_HOST -U $POSTGRES_USER -d $POSTGRES_DATABASE -f ...)
 ```
 
 It should now succeed.

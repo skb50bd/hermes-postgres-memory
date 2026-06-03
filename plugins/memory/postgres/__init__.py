@@ -92,8 +92,8 @@ def _env_float(name: str, default: float, *, minimum: float = 0.0, maximum: floa
     return max(minimum, min(maximum, v))
 
 
-def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
-    raw = os.environ.get(name, "")
+def _env_int(name: str, default: int, minimum: int = 1) -> int:
+    raw = os.environ.get(name, "").strip()
     if not raw:
         return default
     try:
@@ -103,19 +103,83 @@ def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
         return default
 
 
-def _postgres_dsn() -> str:
+# ── Connection-string resolver ──────────────────────────────────────────
+#
+# Single source of truth for the postgres memory plugin's DB connection.
+# The preferred env var is PG_MEM_DB_CONN_STR (a single DSN like
+# "postgresql://user:pass@host:port/dbname"). The legacy POSTGRES_*
+# vars are still accepted for backward compatibility — if they're set
+# and PG_MEM_DB_CONN_STR is not, the plugin builds a DSN from them
+# and emits a one-time deprecation warning. The POSTGRES_* support
+# will be removed in v2.0.
+_LEGACY_POSTGRES_VARS = (
+    "POSTGRES_HOST", "POSTGRES_PORT", "POSTGRES_USER",
+    "POSTGRES_PASSWORD", "POSTGRES_DATABASE",
+)
+_DEPRECATION_LOGGED = False
+
+
+def _build_dsn_from_legacy_vars() -> str:
+    """Construct a postgresql:// DSN from the legacy POSTGRES_* env vars."""
     host = os.environ.get("POSTGRES_HOST", "localhost")
     port = os.environ.get("POSTGRES_PORT", "5432")
     user = os.environ.get("POSTGRES_USER", "hermes")
     password = os.environ.get("POSTGRES_PASSWORD", "")
     database = os.environ.get("POSTGRES_DATABASE", "hermes")
     if not password:
-        raise RuntimeError("POSTGRES_PASSWORD is not set")
+        raise RuntimeError(
+            "PG_MEM_DB_CONN_STR is not set and POSTGRES_PASSWORD is not set. "
+            "Set PG_MEM_DB_CONN_STR='postgresql://user:pass@host:port/dbname' "
+            "in ~/.hermes/.env."
+        )
+    # urllib.parse.quote so passwords with @, /, : etc. don't break the DSN.
+    from urllib.parse import quote
+    return f"postgresql://{quote(user, safe='')}:{quote(password, safe='')}@{host}:{port}/{database}"
+
+
+def get_pg_mem_db_conn_str() -> str:
+    """Return the postgres memory connection string.
+
+    Resolution order:
+      1. PG_MEM_DB_CONN_STR (preferred) — a postgresql:// DSN
+      2. POSTGRES_HOST/POSTGRES_PORT/POSTGRES_USER/POSTGRES_PASSWORD/POSTGRES_DATABASE
+         (legacy) — built into a DSN at first use, with a one-time
+         deprecation warning. Will be removed in v2.0.
+
+    The returned string is a libpq-style DSN that psycopg2 can
+    consume directly via `psycopg2.connect(dsn)`.
+    """
+    global _DEPRECATION_LOGGED
+    explicit = os.environ.get("PG_MEM_DB_CONN_STR", "").strip()
+    if explicit:
+        return explicit
+    # Legacy fallback
+    if any(os.environ.get(v) for v in _LEGACY_POSTGRES_VARS):
+        if not _DEPRECATION_LOGGED:
+            logger.warning(
+                "POSTGRES_HOST/POSTGRES_PORT/POSTGRES_USER/POSTGRES_PASSWORD/POSTGRES_DATABASE "
+                "are deprecated; set PG_MEM_DB_CONN_STR='postgresql://user:pass@host:port/dbname' "
+                "instead. Legacy support will be removed in v2.0."
+            )
+            _DEPRECATION_LOGGED = True
+        return _build_dsn_from_legacy_vars()
+    raise RuntimeError(
+        "No postgres connection configured. Set PG_MEM_DB_CONN_STR in "
+        "~/.hermes/.env, e.g. "
+        "PG_MEM_DB_CONN_STR='postgresql://hermes:*** @10.0.0.1:5432/hermes'"
+    )
+
+
+def _postgres_dsn() -> str:
+    """Build the full psycopg2 DSN, including timeouts and
+    application_name. Uses get_pg_mem_db_conn_str() for the base
+    connection so legacy POSTGRES_* vars still work."""
+    base = get_pg_mem_db_conn_str()
     connect_timeout = _env_int("HERMES_POSTGRES_CONNECT_TIMEOUT", 5, minimum=1)
     statement_timeout = _env_int("HERMES_POSTGRES_STATEMENT_TIMEOUT_MS", 10_000, minimum=100)
     idle_tx_timeout = _env_int("HERMES_POSTGRES_IDLE_TX_TIMEOUT_MS", 30_000, minimum=100)
     return make_dsn(
-        host=host, port=port, dbname=database, user=user, password=password,
+        dsn=base,
         sslmode="prefer", connect_timeout=connect_timeout,
         application_name="hermes-memory-postgres",
         options=f"-c statement_timeout={statement_timeout} -c idle_in_transaction_session_timeout={idle_tx_timeout}",
@@ -220,14 +284,15 @@ def _read_model_config_for_dim(dim: int) -> dict:
     """
     try:
         import psycopg2 as _psy
-        conn = _psy.connect(
-            host=os.environ.get("POSTGRES_HOST", "localhost"),
-            port=int(os.environ.get("POSTGRES_PORT", "5432")),
-            user=os.environ.get("POSTGRES_USER", "hermes"),
-            password=os.environ["POSTGRES_PASSWORD"],
-            dbname=os.environ.get("POSTGRES_DATABASE", "hermes"),
+        # Reuse the plugin's connection-string resolver (handles both
+        # PG_MEM_DB_CONN_STR and legacy POSTGRES_* vars). Override the
+        # default 5s connect_timeout here with a short 5s — same as
+        # the legacy version used to — to keep behavior unchanged.
+        dsn = make_dsn(
+            dsn=get_pg_mem_db_conn_str(),
             connect_timeout=5,
         )
+        conn = _psy.connect(dsn)
     except Exception as exc:
         logger.debug("model config read failed: %s", exc)
         # Fall back to defaults
@@ -693,11 +758,12 @@ class PostgresMemoryProvider(MemoryProvider):
 
     def get_config_schema(self) -> List[Dict[str, Any]]:
         return [
-            {"key": "host", "description": "PostgreSQL host", "default": "localhost", "env_var": "POSTGRES_HOST"},
-            {"key": "port", "description": "PostgreSQL port", "default": "5432", "env_var": "POSTGRES_PORT"},
-            {"key": "user", "description": "PostgreSQL user", "default": "hermes", "env_var": "POSTGRES_USER"},
-            {"key": "password", "description": "PostgreSQL password", "secret": True, "required": True, "env_var": "POSTGRES_PASSWORD"},
-            {"key": "database", "description": "PostgreSQL database name", "default": "hermes", "env_var": "POSTGRES_DATABASE"},
+            {"key": "conn_str",
+             "description": ("PostgreSQL connection string (libpq-style DSN, e.g. "
+                            "'postgresql://hermes:***@10.0.0.1:5432/hermes'). "
+                            "The legacy POSTGRES_HOST/PORT/USER/PASSWORD/DATABASE vars "
+                            "are still accepted but deprecated as of v1.5.0."),
+             "env_var": "PG_MEM_DB_CONN_STR"},
             {"key": "default_dim", "description": "Default embedding dim (768/1024/1536)",
              "default": "1024", "env_var": "HERMES_EMBED_DEFAULT_DIM"},
         ]
@@ -833,9 +899,24 @@ class PostgresMemoryProvider(MemoryProvider):
                            "message": "Memory deleted." if success else "Memory not found."})
 
     def _tool_status(self) -> str:
-        host = os.environ.get("POSTGRES_HOST", "localhost")
-        port = os.environ.get("POSTGRES_PORT", "5432")
-        database = os.environ.get("POSTGRES_DATABASE", "hermes")
+        # Parse the connection string for display purposes (no password
+        # in the output — we strip the userinfo down to user only).
+        dsn = get_pg_mem_db_conn_str()
+        # `make_dsn` can parse libpq DSNs into a dict. Fall back to
+        # the raw string if the parse fails (e.g. someone passed a
+        # raw key=value string).
+        try:
+            from psycopg2.extensions import parse_dsn
+            parsed = parse_dsn(dsn)
+            host = parsed.get("host", "?")
+            port = parsed.get("port", "5432")
+            database = parsed.get("dbname", "?")
+            user = parsed.get("user", "?")
+            display = f"{host}:{port}/{database} (user={user})"
+        except Exception:
+            # Mask the password if the parse failed
+            import re as _re
+            display = _re.sub(r"://[^@/]+@", "://*** @", dsn)
         with self._client._cursor() as cur:
             cur.execute("SELECT version()")
             version = cur.fetchone()[0]
@@ -861,7 +942,7 @@ class PostgresMemoryProvider(MemoryProvider):
                 embedder_info[str(d)] = {"error": str(exc)}
         return json.dumps({
             "status": "connected",
-            "host": f"{host}:{port}/{database}",
+            "host": display,
             "postgres_version": version,
             "pgvector_version": vector_ver[0] if vector_ver else "not installed",
             "total_memories": total,

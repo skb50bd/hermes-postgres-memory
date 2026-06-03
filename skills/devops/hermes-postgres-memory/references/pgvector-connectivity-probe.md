@@ -24,14 +24,20 @@ with open(os.path.expanduser("~/.hermes/.env")) as f:
             k, v = line.split("=", 1)
             env[k] = v.strip('"').strip("'")
 
-conn = psycopg2.connect(
-    host=env["POSTGRES_HOST"],
-    port=env["POSTGRES_PORT"],
-    user=env["POSTGRES_USER"],
-    password=env["POSTGRES_PASSWORD"],
-    dbname=env["POSTGRES_DATABASE"],
-    connect_timeout=5
-)
+# Prefer the single DSN form (v1.5.0+); fall back to legacy POSTGRES_* vars
+# for installs that haven't migrated yet.
+dsn = env.get("PG_MEM_DB_CONN_STR")
+if dsn:
+    conn = psycopg2.connect(dsn, connect_timeout=5)
+else:
+    conn = psycopg2.connect(
+        host=env["POSTGRES_HOST"],
+        port=env["POSTGRES_PORT"],
+        user=env["POSTGRES_USER"],
+        password=env["POSTGRES_PASSWORD"],
+        dbname=env["POSTGRES_DATABASE"],
+        connect_timeout=5,
+    )
 cur = conn.cursor()
 
 # ── Phase 1: Catalog checks (these always work regardless of table grants) ──

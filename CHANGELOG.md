@@ -1,5 +1,98 @@
 # Changelog
 
+## 1.5.0 (2026-06-03)
+
+### Changed
+- **Single DSN env var replaces 5 legacy vars.** The plugin, CLI,
+  bootstrap/uninstall scripts, and diagnostic script now read
+  `PG_MEM_DB_CONN_STR` (a single libpq-style DSN, e.g.
+  `postgresql://hermes:***@10.0.0.1:5432/hermes`) instead of the
+  five legacy `POSTGRES_HOST` / `POSTGRES_PORT` / `POSTGRES_USER` /
+  `POSTGRES_PASSWORD` / `POSTGRES_DATABASE` vars.
+
+  **Backward compatibility:** the legacy `POSTGRES_*` vars still
+  work — `get_pg_mem_db_conn_str()` falls back to them when
+  `PG_MEM_DB_CONN_STR` is unset, building a DSN at first use and
+  emitting a **one-time** `DeprecationWarning` (logged once per
+  process). The plugin's `plugin.yaml` declares
+  `requires_env: PG_MEM_DB_CONN_STR`; `bootstrap.sh` writes the new
+  form to `~/.hermes/.env` (with the legacy form commented out for
+  reference). The `POSTGRES_*` shim will be removed in v2.0.
+
+  **Affected surfaces:**
+  - `plugins/memory/postgres/__init__.py` — new
+    `get_pg_mem_db_conn_str()` resolver + `_LEGACY_POSTGRES_VARS`
+    tuple; `_postgres_dsn()`, `_read_model_config_for_dim()`, the
+    `get_config_schema` description, and `_tool_status()` all
+    consume the resolver.
+  - `plugins/memory/postgres/cli.py` — `_conn()` now consumes the
+    resolver; `psycopg2.connect` uses `make_dsn(dsn=...)` instead
+    of the 5-field form.
+  - `plugins/memory/postgres/scripts/backfill_embeddings.py` —
+    `_connect()` now consumes the resolver.
+  - `plugins/memory/postgres/scripts/bootstrap.sh` — writes
+    `PG_MEM_DB_CONN_STR=...` to `.env` (keeps internal
+    `POSTGRES_HOST/PORT/SUPERUSER` for bootstrap-time superuser
+    psql calls; those map to `psql -h/-p/-U` flags and don't fit
+    the DSN model).
+  - `plugins/memory/postgres/scripts/uninstall.sh` — prefers
+    `psql "$PG_MEM_DB_CONN_STR"`, falls back to legacy
+    `psql -h/-p/-U/-d`.
+  - `plugins/memory/postgres/scripts/diagnose.sh` — `check_creds`
+    and the reachability probe prefer `PG_MEM_DB_CONN_STR`, fall
+    back to legacy, and print a deprecation note when legacy is
+    used. The check name is still `POSTGRES_* env vars` for
+    grep-compatibility with existing alert/monitor configs (the
+    deprecation status is in the detail line).
+  - `plugins/memory/postgres/sql/000_create_database_and_role.sql` —
+    bootstrap end-of-script hint updated to the DSN form.
+  - `plugins/memory/postgres/scripts/install.sh` — post-install
+    hint shows the DSN form.
+  - `bootstrap-message.txt` — non-interactive example and
+    troubleshooting row updated.
+  - `plugins/memory/postgres/plugin.yaml` — `requires_env`
+    updated; description bumped to v1.5.0.
+  - All skill-side docs (`SKILL.md`, `pgvector-connectivity-probe.md`,
+    `migration-privileges.md`) and sidecar scripts
+    (`verify_embeddings.py`, `run_embedding_migration.sh`)
+    updated to prefer the DSN form, with legacy as a
+    documented fallback.
+
+### Fixed
+- **`_tool_status()` no longer leaks the password** in its `host:port/db`
+  field. The new implementation parses `PG_MEM_DB_CONN_STR` via
+  `psycopg2.extensions.parse_dsn` and only includes the user
+  (not the password) in the displayed `host` value. If parsing
+  fails, the password is masked before display.
+- **`_read_model_config_for_dim()` no longer raises on
+  `KeyError('POSTGRES_PASSWORD')`** when only `PG_MEM_DB_CONN_STR`
+  is set. Previously this code path read the legacy vars
+  directly via `os.environ["POSTGRES_PASSWORD"]`, which would
+  throw before the new resolver could be consulted.
+
+### Tests
+- `tests/test_postgres_embeddings.py` — fixture updated to set
+  `PG_MEM_DB_CONN_STR` (DSN form) and explicitly delete the
+  legacy `POSTGRES_*` vars, so the suite exercises the new code
+  path. All 39 tests still pass.
+
+### Migration
+- **Existing installs:** no action required. The legacy
+  `POSTGRES_*` vars keep working; a one-time deprecation warning
+  is logged when the resolver falls back. To silence the
+  warning, replace the 5-line `POSTGRES_*` block in
+  `~/.hermes/.env` with:
+  ```
+  PG_MEM_DB_CONN_STR='postgresql://hermes:YOUR_PASSWORD@YOUR_HOST:5432/hermes'
+  ```
+  The `bootstrap.sh --non-interactive` run can be replayed to
+  rewrite the block automatically (it preserves the existing
+  role name and host but asks for a new password if not in
+  `.env`).
+- **New installs:** `bootstrap.sh` writes the DSN form
+  automatically. `plugin.yaml`'s `requires_env` enforces it at
+  plugin-load time.
+
 ## 1.4.1 (2026-06-03)
 
 ### Fixed

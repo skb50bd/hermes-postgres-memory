@@ -28,14 +28,18 @@ import psycopg2
 
 
 def _conn():
+    """Build a psycopg2 connection from PG_MEM_DB_CONN_STR (preferred)
+    or the legacy POSTGRES_* vars. The plugin's get_pg_mem_db_conn_str
+    helper handles both forms and emits a one-time deprecation warning
+    on legacy use. Will be removed in v2.0."""
+    from psycopg2.extensions import make_dsn
+    from plugins.memory.postgres import get_pg_mem_db_conn_str
     return psycopg2.connect(
-        host=os.environ.get("POSTGRES_HOST", "localhost"),
-        port=int(os.environ.get("POSTGRES_PORT", "5432")),
-        user=os.environ.get("POSTGRES_USER", "hermes"),
-        password=os.environ["POSTGRES_PASSWORD"],
-        dbname=os.environ.get("POSTGRES_DATABASE", "hermes"),
-        connect_timeout=5,
-        application_name="hermes-postgres-memory-cli",
+        make_dsn(
+            dsn=get_pg_mem_db_conn_str(),
+            connect_timeout=5,
+            application_name="hermes-postgres-memory-cli",
+        )
     )
 
 

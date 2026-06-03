@@ -180,11 +180,7 @@ at the configured default_dim will be searchable.
 
 | Var | Default | Notes |
 |---|---|---|
-| `POSTGRES_HOST` | `localhost` | |
-| `POSTGRES_PORT` | `5432` | |
-| `POSTGRES_USER` | `hermes` | |
-| `POSTGRES_PASSWORD` | (required) | |
-| `POSTGRES_DATABASE` | `hermes` | |
+| `PG_MEM_DB_CONN_STR` | (required) | Single libpq DSN. e.g. `postgresql://hermes:***@10.0.0.1:5432/hermes`. The legacy `POSTGRES_*` vars are still accepted but deprecated as of v1.5.0. |
 | `KIMI_API_KEY` | (env) | Free 1024-dim embedder. https://platform.moonshot.cn |
 | `MINIMAX_API_KEY` | (env) | 1536-dim embedder (default for the 1536 column). https://api.minimax.io |
 | `OLLAMA_API_KEY` | (env) | Only needed for ollama_cloud |

@@ -134,13 +134,13 @@ cd /tmp/hpm
 Or non-interactive (for scripted onboarding):
 
 ```bash
-export POSTGRES_HOST=10.49.0.33
-export POSTGRES_PORT=5432
+export PG_MEM_DB_CONN_STR='postgresql://hermes:mySecret@10.49.0.33:5432/hermes'
 export POSTGRES_SUPERUSER=postgres
-export POSTGRES_SUPERUSER_PASSWORD=*** NEW_DB_NAME=hermes
+export POSTGRES_SUPERUSER_PASSWORD=mySuperSecret
+export NEW_DB_NAME=hermes
 export NEW_ROLE_NAME=hermes
-export NEW_ROLE_PASSWORD=***
-....p.sh --non-interactive
+export NEW_ROLE_PASSWORD=myRoleSecret
+./plugins/memory/postgres/scripts/bootstrap.sh --non-interactive
 ```
 
 What it does, in order:
@@ -155,7 +155,7 @@ What it does, in order:
    `agent_memory_settings`, `agent_memory_models`, `memory_categories`,
    the HNSW indexes, the FTS index, the per-dim B-tree indexes
 5. Installs the plugin + skill into `~/.hermes/hermes-agent/`
-6. Appends the `POSTGRES_*` block to `~/.hermes/.env` (with
+6. Appends the `PG_MEM_DB_CONN_STR` block to `~/.hermes/.env` (with
    `KIMI_API_KEY=` left as a comment for the user to fill in)
 7. Sets `memory.provider: postgres` in `~/.hermes/config.yaml` (if
    the `memory:` block exists; otherwise leaves a notice)
@@ -304,7 +304,7 @@ plugin added, and the diagnose is green, the full sequence is:
 
 ```bash
 # 3. Run the bootstrap (interactive — asks for superuser pw)
-...p.sh
+./plugins/memory/postgres/scripts/bootstrap.sh
 
 # 4. User adds KIMI_API_KEY to ~/.hermes/.env
 
@@ -340,7 +340,7 @@ they know what's about to happen. Suggested text:
 >    this.
 > 2. Install the `pgvector` extension in that database.
 > 3. Install the plugin and create the `agent_memory` schema.
-> 4. Add the `POSTGRES_*` env vars to `~/.hermes/.env`.
+> 4. Add the `PG_MEM_DB_CONN_STR` env var to `~/.hermes/.env`.
 > 5. Set `memory.provider: postgres` in `~/.hermes/config.yaml`.
 >
 > I'll need you to add a `KIMI_API_KEY` (free, get one at
@@ -402,13 +402,13 @@ limits, embedding provider selection, dim migration).
    **Important**: `os.environ` may be stale from startup — if the user
    updated `.env` mid-session, re-read it directly (see step 5 probe).
    ```bash
-   for v in POSTGRES_HOST POSTGRES_PORT POSTGRES_USER POSTGRES_PASSWORD POSTGRES_DATABASE; do
+   for v in PG_MEM_DB_CONN_STR POSTGRES_HOST POSTGRES_PORT POSTGRES_USER POSTGRES_PASSWORD POSTGRES_DATABASE; do
      [ -n "${!v}" ] && echo "$v=set" || echo "$v=unset"
    done
    ```
 4. For PostgreSQL, test reachability:
    ```bash
-   pg_isready -h "$POSTGRES_HOST" -p "$POSTGRES_PORT" -U "$POSTGRES_USER" -d "$POSTGRES_DATABASE"
+   pg_isready -d "${PG_MEM_DB_CONN_STR:-postgresql://$POSTGRES_USER:***@$POSTGRES_HOST:$POSTGRES_PORT/$POSTGRES_DATABASE}"
    ```
 5. **The gold-standard probe**: `hermes memory status` can report
    "available ✓" on a dead connection, and it can also miss post-

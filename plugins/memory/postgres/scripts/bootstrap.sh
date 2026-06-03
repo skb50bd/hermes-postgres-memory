@@ -304,14 +304,22 @@ ok "$NEW_ROLE_NAME can connect + pgvector is visible"
 
 header "5 / 6  ·  installing plugin + skill"
 
-# Write a fresh .env block for the plugin (only if not already set)
+# Write a fresh .env block for the plugin (only if not already set).
+# v1.5.0: prefer the single PG_MEM_DB_CONN_STR var (libpq DSN format).
+# The legacy POSTGRES_* form is also written commented-out for users
+# who want to read the individual values.
 ENV_BLOCK="
 # ─── postgres memory provider (added by hermes-postgres-memory bootstrap) ───
-POSTGRES_HOST=$POSTGRES_HOST
-POSTGRES_PORT=$POSTGRES_PORT
-POSTGRES_USER=$NEW_ROLE_NAME
-POSTGRES_PASSWORD=$NEW_ROLE_PASSWORD
-POSTGRES_DATABASE=$NEW_DB_NAME
+# Preferred: a single libpq DSN. Format: postgresql://user:pass@host:port/dbname
+PG_MEM_DB_CONN_STR=postgresql://$NEW_ROLE_NAME:$NEW_ROLE_PASSWORD@$POSTGRES_HOST:$POSTGRES_PORT/$NEW_DB_NAME
+# (Legacy form — still accepted as of v1.5.0 but deprecated, will be
+#  removed in v2.0. Uncomment and use these if you don't want to use
+#  PG_MEM_DB_CONN_STR.)
+# POSTGRES_HOST=$POSTGRES_HOST
+# POSTGRES_PORT=$POSTGRES_PORT
+# POSTGRES_USER=$NEW_ROLE_NAME
+# POSTGRES_PASSWORD=$NEW_ROLE_PASSWORD
+# POSTGRES_DATABASE=$NEW_DB_NAME
 # KIMI_API_KEY=sk-...         # required for the embedder — get one at https://platform.moonshot.cn
 HERMES_EMBED_DEFAULT_DIM=1024
 HERMES_EMBED_FAIL_OPEN=1

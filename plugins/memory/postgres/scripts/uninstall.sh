@@ -225,42 +225,69 @@ if [ $DO_DB -eq 1 ]; then
         set +a
     fi
 
-    : "${POSTGRES_HOST:=localhost}"
-    : "${POSTGRES_PORT:=5432}"
-    : "${POSTGRES_USER:=hermes}"
-    : "${POSTGRES_DATABASE:=hermes}"
+    # Resolve the connection: prefer PG_MEM_DB_CONN_STR (single DSN),
+    # fall back to legacy POSTGRES_* (deprecated, will be removed v2.0).
+    if [ -n "${PG_MEM_DB_CONN_STR:-}" ]; then
+        if ! PGPASSWORD="${PGPASSWORD:-}" psql "$PG_MEM_DB_CONN_STR" -tAc "SELECT 1;" >/dev/null 2>&1; then
+            printf "${RED}✗${RESET} could not connect via PG_MEM_DB_CONN_STR\n"
+            exit 1
+        fi
+    else
+        : "${POSTGRES_HOST:=localhost}"
+        : "${POSTGRES_PORT:=5432}"
+        : "${POSTGRES_USER:=hermes}"
+        : "${POSTGRES_DATABASE:=hermes}"
 
-    if [ -z "${POSTGRES_PASSWORD:-}" ]; then
-        printf "${RED}✗${RESET} POSTGRES_PASSWORD is not set. cannot connect.\n"
-        exit 1
+        if [ -z "${POSTGRES_PASSWORD:-}" ]; then
+            printf "${RED}✗${RESET} POSTGRES_PASSWORD is not set. cannot connect.\n"
+            exit 1
+        fi
+
+        if ! PGPASSWORD="$POS...RD" psql \
+                -h "$POSTGRES_HOST" -p "$POSTGRES_PORT" -U "$POSTGRES_USER" -d "$POSTGRES_DATABASE" \
+                -tAc "SELECT 1;" >/dev/null 2>&1; then
+            printf "${RED}✗${RESET} could not connect as $POSTGRES_USER@$POSTGRES_HOST:$POSTGRES_PORT/$POSTGRES_DATABASE\n"
+            exit 1
+        fi
     fi
 
-    if ! PGPASSWORD="$POS...RD" psql \
-            -h "$POSTGRES_HOST" -p "$POSTGRES_PORT" -U "$POSTGRES_USER" -d "$POSTGRES_DATABASE" \
-            -tAc "SELECT 1;" >/dev/null 2>&1; then
-        printf "${RED}✗${RESET} could not connect as $POSTGRES_USER@$POSTGRES_HOST:$POSTGRES_PORT/$POSTGRES_DATABASE\n"
-        exit 1
-    fi
+    # Build a psql invocation function. Uses PG_MEM_DB_CONN_STR if
+    # present (preferred), else falls back to the legacy per-component
+    # POSTGRES_* form. Output redirected through sed for indentation.
+    psql_run() {
+        if [ -n "${PG_MEM_DB_CONN_STR:-}" ]; then
+            PGPASSWORD="${PGPASSWORD:-}" psql "$PG_MEM_DB_CONN_STR" "$@"
+        else
+            PGPASSWORD="$POS...RD" psql \
+                -h "$POSTGRES_HOST" -p "$POSTGRES_PORT" -U "$POSTGRES_USER" -d "$POSTGRES_DATABASE" \
+                "$@"
+        fi
+    }
 
     # Discover what exists
-    OBJECTS=$(PGPASSWORD="$POS...RD" psql \
-        -h "$POSTGRES_HOST" -p "$POSTGRES_PORT" -U "$POSTGRES_USER" -d "$POSTGRES_DATABASE" \
-        -tAc "SELECT string_agg(table_name, ', ' ORDER BY table_name) FROM information_schema.tables WHERE table_schema='public' AND table_name IN ('agent_memory', 'agent_memory_settings', 'agent_memory_models', 'memory_categories');" \
-        2>/dev/null | tr -d ' ')
+    OBJECTS=$(psql_run -tAc "SELECT string_agg(table_name, ', ' ORDER BY table_name) FROM information_schema.tables WHERE table_schema='public' AND table_name IN ('agent_memory', 'agent_memory_settings', 'agent_memory_models', 'memory_categories');" 2>/dev/null | tr -d ' ')
 
     if [ -z "$OBJECTS" ]; then
-        echo "  no plugin tables found in $POSTGRES_DATABASE. nothing to drop."
+        if [ -n "${PG_MEM_DB_CONN_STR:-}" ]; then
+            DB_LABEL="$PG_MEM_DB_CONN_STR"
+        else
+            DB_LABEL="$POSTGRES_DATABASE"
+        fi
+        echo "  no plugin tables found in $DB_LABEL. nothing to drop."
     else
-        echo "  the following plugin objects exist in $POSTGRES_DATABASE:"
+        if [ -n "${PG_MEM_DB_CONN_STR:-}" ]; then
+            DB_LABEL="$PG_MEM_DB_CONN_STR"
+        else
+            DB_LABEL="$POSTGRES_DATABASE"
+        fi
+        echo "  the following plugin objects exist in $DB_LABEL:"
         echo "    $OBJECTS"
         echo
         echo "  ${BOLD}DROPPING THESE IS IRREVERSIBLE.${RESET} all memories stored by the"
         echo "  plugin will be permanently deleted."
         echo
         if confirm "  drop these tables and their indexes?"; then
-            PGPASSWORD="$POS...RD" psql \
-                -h "$POSTGRES_HOST" -p "$POSTGRES_PORT" -U "$POSTGRES_USER" -d "$POSTGRES_DATABASE" \
-                <<EOF
+            psql_run <<EOF
 DROP TABLE IF EXISTS agent_memory CASCADE;
 DROP TABLE IF EXISTS agent_memory_settings CASCADE;
 DROP TABLE IF EXISTS agent_memory_models CASCADE;
@@ -274,7 +301,13 @@ EOF
 
     # Optional: drop role + database (only with explicit flag)
     if [ $DO_ROLE -eq 1 ]; then
-        if confirm "  drop the application role '$POSTGRES_USER'? (requires connecting as a superuser)"; then
+        # Pick the right role name from the DSN or the legacy var
+        if [ -n "${PG_MEM_DB_CONN_STR:-}" ]; then
+            DROP_ROLE_NAME=$(printf '%s' "$PG_MEM_DB_CONN_STR" | sed -n 's|.*://\([^:@]*\):.*|\1|p')
+        else
+            DROP_ROLE_NAME="$POSTGRES_USER"
+        fi
+        if confirm "  drop the application role '$DROP_ROLE_NAME'? (requires connecting as a superuser)"; then
             : "${POSTGRES_SUPERUSER:=postgres}"
             if [ -z "${POSTGRES_SUPERUSER_PASSWORD:-}" ]; then
                 # Try reading from .env
@@ -287,14 +320,20 @@ EOF
             else
                 PGPASSWORD="$POS...RD" psql \
                     -h "$POSTGRES_HOST" -p "$POSTGRES_PORT" -U "$POSTGRES_SUPERUSER" -d postgres \
-                    -c "DROP ROLE IF EXISTS $POSTGRES_USER;"
+                    -c "DROP ROLE IF EXISTS $DROP_ROLE_NAME;"
                 printf "${GREEN}  ✓${RESET} dropped role\n"
             fi
         fi
     fi
 
     if [ $DO_DATABASE -eq 1 ]; then
-        if confirm "  drop the database '$POSTGRES_DATABASE'? (requires connecting as a superuser)"; then
+        # Pick the right DB name from the DSN or the legacy var
+        if [ -n "${PG_MEM_DB_CONN_STR:-}" ]; then
+            DROP_DB_NAME=$(printf '%s' "$PG_MEM_DB_CONN_STR" | sed -n 's|.*/\([^/?]*\).*|\1|p')
+        else
+            DROP_DB_NAME="$POSTGRES_DATABASE"
+        fi
+        if confirm "  drop the database '$DROP_DB_NAME'? (requires connecting as a superuser)"; then
             : "${POSTGRES_SUPERUSER:=postgres}"
             if [ -z "${POSTGRES_SUPERUSER_PASSWORD:-}" ]; then
                 if [ -f "$ENV_FILE" ] && grep -qE "^POSTGRES_SUPERUSER_PASSWORD=" "$ENV_FILE"; then
@@ -306,7 +345,7 @@ EOF
             else
                 PGPASSWORD="$POS...RD" psql \
                     -h "$POSTGRES_HOST" -p "$POSTGRES_PORT" -U "$POSTGRES_SUPERUSER" -d postgres \
-                    -c "DROP DATABASE IF EXISTS $POSTGRES_DATABASE;"
+                    -c "DROP DATABASE IF EXISTS $DROP_DB_NAME;"
                 printf "${GREEN}  ✓${RESET} dropped database\n"
             fi
         fi

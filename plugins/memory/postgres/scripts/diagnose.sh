@@ -138,27 +138,50 @@ fi
 if [ -f "$ENV_FILE" ]; then
     ok ".env exists" "$ENV_FILE"
 else
-    fail ".env exists" "no .env found at $ENV_FILE — create one with POSTGRES_* and KIMI_API_KEY"
+    fail ".env exists" "no .env found at $ENV_FILE — create one with PG_MEM_DB_CONN_STR and KIMI_API_KEY"
 fi
 
 # Always define the vars to avoid `set -u` blowing up on unset lookups.
+# v1.5.0: prefer PG_MEM_DB_CONN_STR (single libpq DSN). If unset, fall
+# back to the legacy POSTGRES_* form (deprecated, will be removed v2.0).
+PG_MEM_DB_CONN_STR="${PG_MEM_DB_CONN_STR:-}"
 POSTGRES_HOST="${POSTGRES_HOST:-}"
 POSTGRES_PORT="${POSTGRES_PORT:-5432}"
 POSTGRES_USER="${POSTGRES_USER:-hermes}"
 POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-}"
 POSTGRES_DATABASE="${POSTGRES_DATABASE:-hermes}"
 
-MISSING=()
-[ -z "$POSTGRES_HOST" ]     && MISSING+=("POSTGRES_HOST")
-[ -z "$POSTGRES_PORT" ]     && MISSING+=("POSTGRES_PORT")
-[ -z "$POSTGRES_USER" ]     && MISSING+=("POSTGRES_USER")
-[ -z "$POSTGRES_PASSWORD" ] && MISSING+=("POSTGRES_PASSWORD")
-[ -z "$POSTGRES_DATABASE" ] && MISSING+=("POSTGRES_DATABASE")
-
-if [ ${#MISSING[@]} -eq 0 ]; then
-    ok "POSTGRES_* env vars" "all 5 set (host=$POSTGRES_HOST user=$POSTGRES_USER db=$POSTGRES_DATABASE)"
+# If using the new DSN form, parse out the components for psql invocations.
+# (psql accepts the DSN directly, but for pg_isready we still need
+#  host/port/user/dbname, so parse once and reuse.)
+if [ -n "$PG_MEM_DB_CONN_STR" ]; then
+    ok "PG_MEM_DB_CONN_STR env var" "set (using new DSN form)"
+    DSN_HOST=$(printf '%s' "$PG_MEM_DB_CONN_STR" | sed -n 's|.*@\([^:]*\):.*|\1|p')
+    DSN_PORT=$(printf '%s' "$PG_MEM_DB_CONN_STR" | sed -n 's|.*@[^:]*:\([^/]*\)/.*|\1|p')
+    DSN_USER=$(printf '%s' "$PG_MEM_DB_CONN_STR" | sed -n 's|.*://\([^:@]*\):.*|\1|p')
+    DSN_DB=$(printf '%s' "$PG_MEM_DB_CONN_STR" | sed -n 's|.*/\([^/?]*\).*|\1|p')
+    POSTGRES_HOST="${DSN_HOST:-$POSTGRES_HOST}"
+    POSTGRES_PORT="${DSN_PORT:-$POSTGRES_PORT}"
+    POSTGRES_USER="${DSN_USER:-$POSTGRES_USER}"
+    POSTGRES_DATABASE="${DSN_DB:-$POSTGRES_DATABASE}"
+    # PGPASSWORD is also embedded in the DSN — psql's URI parser
+    # accepts `postgresql://user:pass@host:port/db` and uses the passwd
+    # for auth. But pg_isready and other utilities need it explicit.
+    # For a URL-encoded DSN, the password is between : and @, so extract it.
+    PGPASSWORD=$(printf '%s' "$PG_MEM_DB_CONN_STR" | sed -n 's|.*://\([^:@]*\):\([^@]*\)@.*|\2|p' | python3 -c "import sys,urllib.parse;print(urllib.parse.unquote(sys.stdin.read().strip()))" 2>/dev/null || printf '%s' "$PG_MEM_DB_CONN_STR" | sed -n 's|.*://\([^:@]*\):\([^@]*\)@.*|\2|p')
 else
-    fail "POSTGRES_* env vars" "missing in $ENV_FILE: ${MISSING[*]}"
+    MISSING=()
+    [ -z "$POSTGRES_HOST" ]     && MISSING+=("POSTGRES_HOST")
+    [ -z "$POSTGRES_PORT" ]     && MISSING+=("POSTGRES_PORT")
+    [ -z "$POSTGRES_USER" ]     && MISSING+=("POSTGRES_USER")
+    [ -z "$POSTGRES_PASSWORD" ] && MISSING+=("POSTGRES_PASSWORD")
+    [ -z "$POSTGRES_DATABASE" ] && MISSING+=("POSTGRES_DATABASE")
+
+    if [ ${#MISSING[@]} -eq 0 ]; then
+        ok "POSTGRES_* env vars" "all 5 set (host=$POSTGRES_HOST user=$POSTGRES_USER db=$POSTGRES_DATABASE) [deprecated; prefer PG_MEM_DB_CONN_STR]"
+    else
+        fail "PG_MEM_DB_CONN_STR or POSTGRES_* env vars" "neither is set in $ENV_FILE. Set PG_MEM_DB_CONN_STR='postgresql://user:pass@host:port/dbname'"
+    fi
 fi
 
 # ─── 5. embedder key ───────────────────────────────────────────────────
@@ -196,14 +219,21 @@ else
     ok "pg_isready on PATH" "$PGISREADY_BIN"
 fi
 
-# Only run reachability checks if psql + POSTGRES_* are present
-if [ -n "$PSQL_BIN" ] && [ -n "$POSTGRES_HOST" ] && [ -n "$POSTGRES_PASSWORD" ] && [ -n "$POSTGRES_USER" ]; then
+# Only run reachability checks if psql + connection details are present.
+# Prefers PG_MEM_DB_CONN_STR (DSN form, used directly by psql). Falls
+# back to the legacy POSTGRES_* per-component form.
+if [ -n "$PSQL_BIN" ] && [ -n "${PG_MEM_DB_CONN_STR:-}" ]; then
+    if PGPASSWORD="$PGPASSWORD" "$PGISREADY_BIN" -d "$PG_MEM_DB_CONN_STR" -q; then
+        ok "postgres reachable" "$POSTGRES_HOST:$POSTGRES_PORT (user=$POSTGRES_USER, db=$POSTGRES_DATABASE)"
+    else
+        fail "postgres reachable" "pg_isready failed via PG_MEM_DB_CONN_STR. Check host/port/firewall/role."
+    fi
+elif [ -n "$PSQL_BIN" ] && [ -n "$POSTGRES_HOST" ] && [ -n "$POSTGRES_PASSWORD" ] && [ -n "$POSTGRES_USER" ]; then
     if PGPASSWORD="$POSTGRES_PASSWORD" "$PGISREADY_BIN" -h "$POSTGRES_HOST" -p "$POSTGRES_PORT" -U "$POSTGRES_USER" -d "$POSTGRES_DATABASE" -q; then
         ok "postgres reachable" "$POSTGRES_HOST:$POSTGRES_PORT (user=$POSTGRES_USER, db=$POSTGRES_DATABASE)"
     else
         fail "postgres reachable" "pg_isready failed — check host/port, firewall, and that the role exists. Run 'psql -h $POSTGRES_HOST -U $POSTGRES_USER -d $POSTGRES_DATABASE' manually for the raw error."
     fi
-
     # ─── 8-10. role can connect + extensions + schema ownership ──────
 
     # 8. Role can connect
@@ -284,7 +314,7 @@ if [ -n "$PSQL_BIN" ] && [ -n "$POSTGRES_HOST" ] && [ -n "$POSTGRES_PASSWORD" ] 
         skip "HNSW indexes" "will be created by sql/000_schema.sql"
     fi
 else
-    fail "postgres reachability preflight" "could not run — psql missing or POSTGRES_* unset. Fix those first."
+    fail "postgres reachability preflight" "could not run — psql missing or connection details unset. Set PG_MEM_DB_CONN_STR or POSTGRES_* in $ENV_FILE. Fix those first."
     skip "role can connect"        "blocked by earlier failure"
     skip "pgvector extension"     "blocked by earlier failure"
     skip "public schema owner"    "blocked by earlier failure"

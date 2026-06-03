@@ -35,6 +35,8 @@ EOF
 done
 
 # Accept HERMES_HOME as either ~/.hermes or ~/.hermes/hermes-agent.
+# In profile mode, HERMES_HOME is ~/.hermes/profiles/<name> and each
+# profile has its own .env that the root ~/.hermes/.env is NOT inherited.
 if [ -d "$HERMES_HOME" ] && [ ! -f "$HERMES_HOME/run_agent.py" ] && [ ! -f "$HERMES_HOME/AGENTS.md" ] && [ -d "$HERMES_HOME/hermes-agent" ]; then
     HERMES_HOME="$HERMES_HOME/hermes-agent"
 fi
@@ -45,8 +47,12 @@ if [ ! -d "$HERMES_HOME" ] && [ -d "$HERMES_HOME/.hermes/hermes-agent" ]; then
     HERMES_HOME="$HERMES_HOME/.hermes/hermes-agent"
 fi
 
-ENV_FILE="${HERMES_HOME%/hermes-agent}/.env"
-[ -f "$ENV_FILE" ] || ENV_FILE="$HOME/.hermes/.env"
+if [[ "$HERMES_HOME" == */profiles/* ]]; then
+    ENV_FILE="$HERMES_HOME/.env"
+else
+    ENV_FILE="${HERMES_HOME%/hermes-agent}/.env"
+    [ -f "$ENV_FILE" ] || ENV_FILE="$HOME/.hermes/.env"
+fi
 if [ -f "$ENV_FILE" ]; then
     set -a
     # shellcheck disable=SC1090

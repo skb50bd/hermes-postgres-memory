@@ -308,6 +308,97 @@ known registration shape in some builds.
 
 Then smoke test with `pg_remember` and `pg_search`.
 
+## Recipe D — Hermes profiles (multi-instance)
+
+When the user runs multiple Hermes instances under `hermes profile …`, each
+profile has its own `~/.hermes/profiles/<name>/` tree with its own
+`config.yaml`, its own `.env`, and its own skills directory. The root
+`~/.hermes/.env` is **not** inherited by profiles. This breaks naive copies of
+the install/bootstrap recipes. Use this recipe instead.
+
+### Key gotchas
+
+- `HERMES_HOME` is `~/.hermes/profiles/<name>` for a profile, not
+  `~/.hermes/hermes-agent`. Bootstrap and diagnose scripts now resolve the
+  profile path automatically; the install script copies plugin files into
+  `$HERMES_HOME/plugins/memory/postgres` which under a profile means
+  `~/.hermes/profiles/<name>/plugins/memory/postgres`.
+- Each profile needs its **own** `PG_MEM_DB_CONN_STR` entry in
+  `~/.hermes/profiles/<name>/.env`. The plugin reads only the active
+  profile's `.env`.
+- Profile config is at `~/.hermes/profiles/<name>/config.yaml`. Set
+  `memory.provider: postgres` per profile.
+- After install/config changes, restart the right process:
+  `hermes -p <name> gateway restart`, or restart the specific profile's
+  gateway process.
+- Tool availability is per-session. Existing profile sessions do **not** see
+  newly installed plugins until `/reset` or a fresh `hermes -p <name>`.
+
+### Storage topology — pick one
+
+Two reasonable layouts. Pick explicitly; do not mix mid-deployment.
+
+**Layout 1 (default): shared DB, shared schema.** All profiles connect to the
+same `PG_MEM_DB_CONN_STR`. Memory rows are shared across profiles; nothing
+extra to do. Best when profiles are personal variants of one operator (e.g.
+default vs worktrees) and you want one brain.
+
+**Layout 2: one DB per profile.** Each profile gets its own database (and
+ideally its own runtime role) under a single Postgres server. Cleaner blast
+radius — you can drop `hermes_sportsverse` without nuking `hermes_admin`.
+Required when profiles are owned by different operators on the same host or
+when one profile is unstable and you want isolation.
+
+Bootstrap for Layout 2:
+
+```bash
+# 1. As DB admin, create role+db for the new profile (mirrors the admin SQL file).
+psql -h <host> -U postgres -d postgres \
+  -v dbname='hermes_<profile>' \
+  -v rolename='hermes_<profile>' \
+  -v pw='choose_a_strong_password' \
+  -v connlimit='20' \
+  -f ~/repos/hermes-postgres-memory/plugins/memory/postgres/sql/000_create_database_and_role.sql
+
+# 2. Bootstrap the new profile with its own DSN.
+hermes -p <profile> -- skills list >/dev/null  # ensure profile exists
+PG_MEM_DB_CONN_STR='postgresql://hermes_<profile>:***@host:5432/hermes_<profile>' \
+  HERMES_HOME="$HOME/.hermes/profiles/<profile>" \
+  ~/repos/hermes-postgres-memory/plugins/memory/postgres/scripts/bootstrap.sh
+```
+
+The bootstrap script auto-detects profile mode (its `HERMES_HOME` contains
+`/profiles/`) and writes `PG_MEM_DB_CONN_STR` into the profile's own
+`~/.hermes/profiles/<profile>/.env`.
+
+### Connection limit math
+
+The default `CONNECTION LIMIT 20` is for **one** runtime role. Each profile
+opens its own pool (default 1-5 connections per agent process, more with
+subagents and cron). For N profiles, plan at least `20 * N` as a floor.
+Bump the role's `CONNECTION LIMIT` to `30 * N` for headroom. Avoid unlimited
+roles — a bug in one profile can saturate the server. See
+`references/postgres-memory-connection-limits.md` for the full breakdown.
+
+### Verify a profile install
+
+```bash
+hermes -p <profile> postgres-memory preflight || true
+hermes -p <profile> postgres-memory status || true
+hermes -p <profile> postgres-memory model-list || true
+```
+
+Or via direct probes with the profile's DSN:
+
+```bash
+hermes -p <profile> config env-path  # prints the .env path the profile uses
+set -a; . "$(hermes -p <profile> config env-path)"; set +a
+psql "$PG_MEM_DB_CONN_STR" -tAc "SELECT current_user, current_database();"
+```
+
+If `pg_status`/`pg_remember` work in a `hermes -p <profile>` session, the
+profile is wired correctly.
+
 ## Direct database verification
 
 Use these only after `PG_MEM_DB_CONN_STR` is available:

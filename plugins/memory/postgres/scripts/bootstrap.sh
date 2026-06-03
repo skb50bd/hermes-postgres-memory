@@ -125,8 +125,16 @@ if [ ! -d "$HERMES_HOME" ] || [ ! -d "$HERMES_HOME/plugins/memory" ]; then
 fi
 ok "hermes-agent at $HERMES_HOME"
 
-ENV_FILE="${HERMES_HOME%/hermes-agent}/.env"
-[ -f "$ENV_FILE" ] || ENV_FILE="$HOME/.hermes/.env"
+# Resolve the .env path. In a profile-mode Hermes install, the active
+# profile has its own .env at ~/.hermes/profiles/<name>/.env and the
+# root ~/.hermes/.env is NOT inherited. HERMES_HOME for a profile is
+# ~/.hermes/profiles/<name>; for the root instance it is ~/.hermes.
+if [ -d "$HERMES_HOME" ] && [[ "$HERMES_HOME" == */profiles/* ]]; then
+    ENV_FILE="$HERMES_HOME/.env"
+else
+    ENV_FILE="${HERMES_HOME%/hermes-agent}/.env"
+    [ -f "$ENV_FILE" ] || ENV_FILE="$HOME/.hermes/.env"
+fi
 if [ -f "$ENV_FILE" ]; then
     set -a
     # shellcheck disable=SC1090

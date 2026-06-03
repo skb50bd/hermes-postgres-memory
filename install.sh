@@ -24,6 +24,8 @@ HERMES_HOME="${HERMES_HOME:-$HOME/.hermes/hermes-agent}"
 # for the full rationale. The agent runtime exports HERMES_HOME as the
 # parent (/home/u/.hermes), but install.sh expects the checkout
 # (/home/u/.hermes/hermes-agent). Resolve the mismatch once, here.
+# In profile mode, HERMES_HOME is ~/.hermes/profiles/<name> and each
+# profile has its own .env.
 if [ -d "$HERMES_HOME" ]; then
     if [ ! -f "$HERMES_HOME/run_agent.py" ] && [ ! -f "$HERMES_HOME/AGENTS.md" ] && [ -d "$HERMES_HOME/hermes-agent" ]; then
         HERMES_HOME="$HERMES_HOME/hermes-agent"

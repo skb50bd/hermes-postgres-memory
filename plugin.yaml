@@ -1,0 +1,23 @@
+name: hermes-postgres-memory
+version: 1.7.0
+description: "PostgreSQL + pgvector memory — HNSW semantic search, full-text search, hybrid retrieval, categories, tags, TTL, soft deletes, and pluggable embedders. Top-level manifest for `hermes plugins install` discovery; the actual provider lives at `plugins/memory/postgres/`."
+author: "Shakib Haris"
+license: "MIT"
+pip_dependencies:
+  - httpx
+requires_env:
+  - PG_MEM_DB_CONN_STR
+
+# The runtime plugin lives at plugins/memory/postgres/ (memory-provider
+# layout scanned by plugins/memory/__init__.py::_iter_provider_dirs).
+# The root `plugin.yaml` exists so `hermes plugins install` — which only
+# inspects the repo root — finds a valid manifest. It is not used by the
+# runtime: once installed, the canonical provider dir is
+# `~/.hermes/plugins/postgres/` (or the bundled `plugins/memory/postgres/`
+# copy) and discovery imports the inner `__init__.py` directly.
+#
+# For the greenfield install path (DBA prerequisites + bootstrap + plugin
+# drop), use `./install.sh` instead. That script is the source of truth and
+# copies the inner plugin to the canonical user-installed location.
+#
+# The contract is pinned by tests/test_install_layout.py.

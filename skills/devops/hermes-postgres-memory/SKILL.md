@@ -1,86 +1,147 @@
 ---
 name: hermes-postgres-memory
-description: "Install, configure, troubleshoot, and harden the greenfield PostgreSQL/pgvector memory provider for Hermes Agent."
-version: 1.6.1
+description: "Recipe for installing, enabling, verifying, and troubleshooting the Hermes PostgreSQL/pgvector memory provider."
+version: 1.7.0
 author: Shakib Haris
 license: MIT
 platforms: [linux, macos, windows]
 metadata:
   hermes:
-    tags: [hermes-agent, memory, postgres, pgvector, embeddings, onboarding, preflight, multi-dim, troubleshooting, connection-pooling]
+    tags: [hermes-agent, memory, postgres, pgvector, embeddings, recipe, onboarding, preflight, troubleshooting]
     related_skills: [hermes-agent, hermes-gateway-troubleshooting, systematic-debugging]
 ---
 
-# Hermes Postgres Memory Provider
+# Hermes Postgres Memory Provider Recipe
 
-Greenfield PostgreSQL + pgvector memory backend for Hermes Agent.
+Use this skill whenever the user asks to install, configure, enable, verify,
+diagnose, tune, or uninstall the PostgreSQL memory plugin for Hermes Agent.
 
-The project intentionally supports only the current schema and current runtime
-configuration. Git is the version history. Migration docs, compatibility shims,
-and old connection forms are not part of the user-facing workflow.
+This is the canonical recipe. Do not make the user copy instructions from chat
+into another place. Follow the steps from here, use the repo scripts, and verify
+with real commands before claiming success. Apparently “it should work” is not a
+test plan. Shocking.
 
-## Current contract
+## Non-negotiable contract
 
-- Required runtime DB config: `PG_MEM_DB_CONN_STR` (URI DSN or semicolon connection string)
-- Schema: `agent_memory` with `vector_768`, `vector_1024`, and `vector_1536`
-- Default dim: `1024`
-- Default 1024 provider/model: `kimi` / `bge_m3_embed`
+- Runtime DB config is exactly `PG_MEM_DB_CONN_STR`.
+- The old five-variable `POSTGRES_*` connection form is not supported.
+- `PG_MEM_DB_CONN_STR` may be either:
+  - URI DSN: `postgresql://hermes:***@host:5432/hermes`
+  - Semicolon DSN: `Host=host;Port=5432;Database=hermes;Username=hermes;Password=***`
+- The Hermes agent/runtime should **not** have PostgreSQL superuser access.
+- Privileged PostgreSQL work is a DBA/user prerequisite, not agent work:
+  - create role/database
+  - install `pgvector`
+  - transfer `public` schema ownership to the runtime role
+  - grant schema object creation rights
+- Agent-side automation verifies prerequisites and fails loud. It does not ask
+  for superuser credentials and does not improvise with elevated access.
+- Schema is greenfield-only:
+  - `agent_memory.vector_768`
+  - `agent_memory.vector_1024`
+  - `agent_memory.vector_1536`
+- Default embedding dimension: `1024`.
+- Default 1024 provider/model: `kimi` / `bge_m3_embed`.
 
-## When to use
+## Required project location
 
-Load this skill when the user asks to:
-
-- Install or configure the Postgres memory plugin
-- Diagnose `pg_remember`, `pg_search`, or `pg_status`
-- Verify that embeddings are stored and searchable
-- Tune connection limits or embedder provider settings
-- Uninstall the plugin
-
-If the user asks about Hermes Agent CLI/config/gateway itself, also load
-`hermes-agent` before answering.
-
-## Greenfield install
-
-The agent/runtime should not have PostgreSQL superuser access. Treat role/database
-creation, `CREATE EXTENSION vector`, and schema ownership grants as DBA
-prerequisites. The agent verifies them before installing or using the plugin.
+The plugin repo normally lives at:
 
 ```bash
-git clone https://github.com/skb50bd/hermes-postgres-memory.git /tmp/hpm
-cd /tmp/hpm
+~/repos/hermes-postgres-memory
+```
+
+If missing, clone it:
+
+```bash
+mkdir -p ~/repos
+cd ~/repos
+git clone https://github.com/skb50bd/hermes-postgres-memory.git
+cd ~/repos/hermes-postgres-memory
+```
+
+If the repo already exists, update it before install work:
+
+```bash
+cd ~/repos/hermes-postgres-memory
+git fetch origin
+git status --short --branch
+```
+
+Do not blindly reset local changes. If dirty, inspect and ask before destructive
+git operations.
+
+## Recipe A — fresh install with DBA prerequisites already done
+
+Use this when the user/admin has already created the database role, installed
+pgvector, and provided `PG_MEM_DB_CONN_STR`.
+
+### 1. Confirm local prerequisites
+
+```bash
+cd ~/repos/hermes-postgres-memory
+command -v psql
+command -v pg_isready
+python3 --version
+```
+
+If `psql` / `pg_isready` is missing, install PostgreSQL client tools first.
+
+### 2. Run agent-side bootstrap
+
+Use the runtime DSN from the user/admin:
+
+```bash
+cd ~/repos/hermes-postgres-memory
 PG_MEM_DB_CONN_STR='postgresql://hermes:***@host:5432/hermes' \
   ./plugins/memory/postgres/scripts/bootstrap.sh
 ```
 
-The bootstrap script:
+What bootstrap does:
 
-1. Checks `psql`, Python, psycopg2, and the Hermes checkout.
-2. Reads `PG_MEM_DB_CONN_STR` for the dedicated non-superuser runtime role.
-3. Verifies DBA prerequisites: runtime role is not superuser, pgvector exists, public schema is owned by the runtime role, and object creation works.
-4. Writes a single `PG_MEM_DB_CONN_STR` entry to `~/.hermes/.env` if missing.
-5. Installs the plugin and this skill into the Hermes checkout.
-6. Creates the greenfield schema via `sql/000_schema.sql` using the runtime role.
-7. Runs `diagnose.sh`.
+1. Checks local tooling and Hermes checkout.
+2. Reads `PG_MEM_DB_CONN_STR`.
+3. Refuses a superuser runtime role.
+4. Verifies pgvector is installed.
+5. Verifies `public` schema is owned by the runtime role.
+6. Verifies the runtime role can create/drop plugin objects.
+7. Writes `PG_MEM_DB_CONN_STR` to `~/.hermes/.env` if missing.
+8. Installs plugin files and this skill into Hermes.
+9. Applies `000_schema.sql` using the runtime role.
+10. Runs final preflight.
 
-After bootstrap, the user must add an embedder key and restart Hermes:
+If bootstrap fails on DB privileges, stop. Hand the user/admin the admin-side
+SQL file path and the failing check. Do not ask for or use superuser creds.
+
+Admin-side SQL file:
+
+```text
+~/repos/hermes-postgres-memory/plugins/memory/postgres/sql/000_create_database_and_role.sql
+```
+
+### 3. Add embedder credentials
+
+Default 1024-dim embedding uses Kimi/Moonshot:
 
 ```bash
+hermes config env-path
+# edit the shown .env and add:
 KIMI_API_KEY=sk-...
-hermes gateway restart
 ```
 
-## Existing database install
+Other supported dimensions/providers exist, but do not switch providers just
+because a key is missing. Ask or fail clearly.
 
-If `~/.hermes/.env` already has the DSN and DBA prerequisites are complete:
+### 4. Enable provider in Hermes config
+
+Use Hermes CLI when possible:
 
 ```bash
-cd ~/repos/hermes-postgres-memory
-./install.sh
-psql "$PG_MEM_DB_CONN_STR" -f plugins/memory/postgres/sql/000_schema.sql
-hermes postgres-memory preflight
+hermes config set memory.memory_enabled true
+hermes config set memory.provider postgres
 ```
 
-Set Hermes config:
+If CLI config setting fails, edit `~/.hermes/config.yaml` manually:
 
 ```yaml
 memory:
@@ -88,146 +149,314 @@ memory:
   provider: postgres
 ```
 
-Restart after changing config or `.env`.
-
-## Required environment
+Restart after config or `.env` changes:
 
 ```bash
-PG_MEM_DB_CONN_STR='postgresql://hermes:***@host:5432/hermes'
-KIMI_API_KEY='***'
+hermes gateway restart
 ```
 
-Optional embedder/pool env vars:
+For CLI-only use, start a fresh `hermes` process instead.
 
-- `HERMES_EMBED_DEFAULT_DIM=1024`
-- `HERMES_EMBED_FAIL_OPEN=1`
-- `HERMES_POSTGRES_POOL_MIN=0`
-- `HERMES_POSTGRES_POOL_MAX=2`
-- `HERMES_POSTGRES_CONNECT_TIMEOUT=5`
-- `HERMES_POSTGRES_STATEMENT_TIMEOUT_MS=10000`
+### 5. Verify before claiming success
 
-Do not diagnose runtime connection issues with the old five-variable DB env
-form. If `PG_MEM_DB_CONN_STR` is missing, the plugin should fail loudly.
-
-## Verification workflow
-
-Run these before telling the user it works:
+Run all of these:
 
 ```bash
+cd ~/repos/hermes-postgres-memory
+./plugins/memory/postgres/scripts/diagnose.sh
 hermes postgres-memory preflight
 hermes postgres-memory status
 hermes postgres-memory model-list
 ```
 
-Then smoke test from a fresh Hermes session:
+Expected high-level result:
+
+- `PG_MEM_DB_CONN_STR` set
+- runtime role can connect
+- runtime role is non-superuser
+- pgvector installed
+- public schema owner is runtime role
+- all tables exist
+- `vector_768`, `vector_1024`, `vector_1536` exist
+- three model rows registered
+- HNSW indexes exist
+
+Then run a real Hermes tool smoke test in a fresh session:
 
 ```text
 pg_remember(content="postgres plugin is live", category="fact")
 pg_search(query="postgres plugin")
+pg_status()
 ```
 
-For direct DB verification:
+Only say it works after the smoke test returns real results.
 
-```sql
-SELECT count(*) FROM agent_memory WHERE is_active = true;
-SELECT count(*) FROM agent_memory WHERE vector_1024 IS NOT NULL;
+## Recipe B — admin prerequisites are not done yet
+
+Use this when the user says they have pgAdmin/DBA access, or when bootstrap says
+pgvector/schema ownership/object creation is missing.
+
+Give the user/admin this file, not a hand-wavy paragraph:
+
+```text
+~/repos/hermes-postgres-memory/plugins/memory/postgres/sql/000_create_database_and_role.sql
 ```
 
-## CLI commands
+Tell them to run it as PostgreSQL admin/superuser, with variables if needed:
 
 ```bash
+psql -h <host> -U postgres -d postgres \
+  -v dbname='hermes' \
+  -v rolename='hermes' \
+  -v pw='choose_a_strong_password' \
+  -v connlimit='20' \
+  -f plugins/memory/postgres/sql/000_create_database_and_role.sql
+```
+
+After they say it is done, continue with Recipe A using the final runtime DSN.
+
+The admin-side script creates/verifies:
+
+- non-superuser runtime role
+- target database
+- `CREATE EXTENSION IF NOT EXISTS vector`
+- `ALTER SCHEMA public OWNER TO <runtime role>`
+- `GRANT ALL ON SCHEMA public TO <runtime role>`
+- connection limit
+
+## Recipe C — plugin files installed but memory not active
+
+Use this when files exist but `pg_remember`, `pg_search`, or `pg_status` are
+missing/failing.
+
+### 1. Verify install paths
+
+```bash
+test -d ~/.hermes/hermes-agent/plugins/memory/postgres && echo plugin-present
+test -d ~/.hermes/hermes-agent/skills/devops/hermes-postgres-memory && echo skill-present
+```
+
+If missing:
+
+```bash
+cd ~/repos/hermes-postgres-memory
+./install.sh --yes
+```
+
+### 2. Verify env/config
+
+```bash
+hermes config env-path
+hermes config path
+grep '^PG_MEM_DB_CONN_STR=' ~/.hermes/.env
+hermes config | grep -A5 '^memory:'
+```
+
+Config must include:
+
+```yaml
+memory:
+  memory_enabled: true
+  provider: postgres
+```
+
+### 3. Restart
+
+```bash
+hermes gateway restart
+```
+
+Start a new CLI/gateway session. Tool availability is snapshotted per session;
+old sessions may not see the new plugin. Yes, cache invalidation is still the
+villain.
+
+### 4. Re-run verification
+
+```bash
+hermes postgres-memory preflight
 hermes postgres-memory status
 hermes postgres-memory model-list
-hermes postgres-memory model-set --dim 1024
-hermes postgres-memory backfill --dim 1024
-hermes postgres-memory preflight
 ```
 
-## Backfill
+Then smoke test with `pg_remember` and `pg_search`.
 
-Backfill is for populating missing vectors in existing rows. It is idempotent.
+## Direct database verification
+
+Use these only after `PG_MEM_DB_CONN_STR` is available:
 
 ```bash
+psql "$PG_MEM_DB_CONN_STR" -tAc "SELECT current_user;"
+psql "$PG_MEM_DB_CONN_STR" -tAc "SELECT rolsuper FROM pg_roles WHERE rolname = current_user;"
+psql "$PG_MEM_DB_CONN_STR" -tAc "SELECT extversion FROM pg_extension WHERE extname='vector';"
+psql "$PG_MEM_DB_CONN_STR" -tAc "SELECT pg_catalog.pg_get_userbyid(nspowner) FROM pg_namespace WHERE nspname='public';"
+psql "$PG_MEM_DB_CONN_STR" -tAc "SELECT to_regclass('public.agent_memory');"
+psql "$PG_MEM_DB_CONN_STR" -tAc "SELECT count(*) FROM agent_memory_models WHERE dim IN (768,1024,1536);"
+psql "$PG_MEM_DB_CONN_STR" -tAc "SELECT count(*) FROM agent_memory WHERE vector_1024 IS NOT NULL;"
+```
+
+Interpretation:
+
+- `rolsuper` must be `f`.
+- extension query must return a pgvector version.
+- public schema owner must equal runtime role.
+- `agent_memory` must resolve.
+- model count must be `3`.
+
+## Model and dimension operations
+
+Show current model registry:
+
+```bash
+hermes postgres-memory model-list
+```
+
+Set default dimension:
+
+```bash
+hermes postgres-memory model-set --dim 1024
+```
+
+Set explicit provider/model:
+
+```bash
+hermes postgres-memory model-set --dim 1024 --provider kimi --model bge_m3_embed
+```
+
+Backfill missing embeddings:
+
+```bash
+cd ~/repos/hermes-postgres-memory
 python plugins/memory/postgres/scripts/backfill_embeddings.py --dim 1024
+```
+
+Without `--dim`, backfill attempts all supported dimensions:
+
+```bash
 python plugins/memory/postgres/scripts/backfill_embeddings.py
 ```
 
-Without `--dim`, it attempts all supported dimensions.
+## Troubleshooting decision tree
 
-## Troubleshooting
+### `PG_MEM_DB_CONN_STR` missing
 
-### Provider unavailable
+Fix `.env`:
 
-1. Confirm `.env` contains `PG_MEM_DB_CONN_STR`.
-2. Re-read `.env` directly; do not trust stale process env after an edit.
-3. Run:
-   ```bash
-   pg_isready -d "$PG_MEM_DB_CONN_STR"
-   psql "$PG_MEM_DB_CONN_STR" -tAc "SELECT 1;"
-   psql "$PG_MEM_DB_CONN_STR" -tAc "SELECT 1 FROM pg_extension WHERE extname='vector';"
-   ```
-4. Run `hermes postgres-memory preflight`.
-5. If pgvector, schema ownership, or object creation fails, stop and hand the user/admin `sql/000_create_database_and_role.sql`; do not request or use PostgreSQL superuser credentials from the agent.
+```bash
+hermes config env-path
+```
+
+Add one line:
+
+```bash
+PG_MEM_DB_CONN_STR='postgresql://hermes:***@host:5432/hermes'
+```
+
+Restart Hermes.
+
+### Cannot connect
+
+Run:
+
+```bash
+pg_isready -d "$PG_MEM_DB_CONN_STR"
+psql "$PG_MEM_DB_CONN_STR" -tAc "SELECT 1;"
+```
+
+If it fails, this is host/port/firewall/credential/DB availability. Do not edit
+plugin code yet. The database is unreachable. Heroic debugging of Python at this
+stage is just performance art.
+
+### Runtime role is superuser
+
+Refuse it. Ask for a dedicated non-superuser app role DSN.
+
+### pgvector missing
+
+Admin prerequisite missing. Give the admin SQL file path:
+
+```text
+plugins/memory/postgres/sql/000_create_database_and_role.sql
+```
+
+### Public schema owner mismatch
+
+Admin prerequisite missing. Runtime role must own `public` so it can create and
+maintain plugin tables/indexes.
+
+Admin fix pattern:
+
+```sql
+ALTER SCHEMA public OWNER TO hermes;
+GRANT ALL ON SCHEMA public TO hermes;
+```
+
+### Tables/indexes missing
+
+If privilege checks pass, apply schema:
+
+```bash
+cd ~/repos/hermes-postgres-memory
+psql "$PG_MEM_DB_CONN_STR" -v ON_ERROR_STOP=1 -f plugins/memory/postgres/sql/000_schema.sql
+```
+
+If this fails with permission errors, go back to admin prerequisites.
 
 ### Search returns nothing
 
-- Confirm the queried dimension column has vectors:
-  ```sql
-  SELECT count(*) FROM agent_memory WHERE vector_1024 IS NOT NULL;
-  ```
-- Confirm the query has token overlap. The current hybrid search uses FTS as
-  a candidate pre-filter, then reranks with vector similarity. No FTS overlap
-  can mean no candidates.
-- If filtering by `target` or `category`, check SQL param ordering in
-  `search_memories`; where-clause params belong between the first query param
-  and the second query param.
+Check whether vectors exist:
 
-### Embeddings fail open
+```sql
+SELECT count(*) FROM agent_memory WHERE vector_1024 IS NOT NULL;
+```
 
-If `HERMES_EMBED_FAIL_OPEN=1`, provider failures can write zero vectors.
-Backfill after fixing the provider key/network:
+If zero, fix embedder key/network and backfill.
+
+Also remember: current hybrid search uses full-text search as a candidate
+prefilter, then vector rerank. No token overlap can mean no candidates.
+
+### Embeddings write zero vectors
+
+If `HERMES_EMBED_FAIL_OPEN=1`, provider failures can write zero vectors. Fix the
+provider key/network, then backfill:
 
 ```bash
 python plugins/memory/postgres/scripts/backfill_embeddings.py --dim 1024
 ```
 
-### Connection pressure
+## Uninstall recipe
 
-Recommended single-user defaults:
-
-- DB role connection limit: 20
-- Plugin pool max per process: 2
-- Connect timeout: 3–5s
-- Statement timeout: 10s
-
-Inspect activity:
-
-```sql
-SELECT usename, state, count(*)
-FROM pg_stat_activity
-WHERE usename = current_user
-GROUP BY usename, state;
-```
-
-## Uninstall
+Plugin files only:
 
 ```bash
+cd ~/repos/hermes-postgres-memory
 plugins/memory/postgres/scripts/uninstall.sh --plugin
+```
+
+Plugin DB tables only:
+
+```bash
 plugins/memory/postgres/scripts/uninstall.sh --db --yes
+```
+
+Everything agent-side:
+
+```bash
 plugins/memory/postgres/scripts/uninstall.sh --all --yes
 ```
 
-The DB mode drops plugin tables. Dropping the role or database requires the
-explicit `--role` / `--database` flags.
+Dropping the PostgreSQL role/database/extension is admin-owned. Do not assume the
+agent can or should do it.
 
-## Pitfalls
+## Agent behavior rules
 
-- Subprocesses do not automatically source `~/.hermes/.env`; scripts that need
-  keys should read `.env` themselves or be launched from a sourced shell.
-- Do not hardcode alternate providers when a key is missing; fail loudly or use
-  the documented `noop` provider for tests.
-- Every vector in a given `vector_<dim>` column must come from the same model.
-  Mixing models inside a column silently ruins similarity scores.
-- Do not claim embeddings work from schema alone. Verify non-null/non-zero
-  vectors and run a real `pg_search` smoke test.
-- Never assume the agent has PostgreSQL superuser access. Privileged DB work is prerequisite/admin-owned; agent-side automation verifies and fails loud.
+- Load this skill before working on Postgres memory.
+- If the task touches Hermes CLI/config/gateway behavior, also load
+  `hermes-agent`.
+- Prefer the repo scripts over hand-rolled shell snippets.
+- Never use or request PostgreSQL superuser credentials for the agent.
+- Never claim success from file installation alone. Verify DB + CLI + actual
+  memory tools.
+- If `.env` is edited, restart gateway or start a fresh Hermes CLI session.
+- If a command fails, report the exact failing check and the next concrete fix.
+- If you discover a recurring pitfall not covered here, patch this skill before
+  finishing.

@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.5.1 (2026-06-03)
+
+### Fixed
+- **`plugin.yaml` no longer requires `HERMES_EMBED_PROVIDER`.** The
+  embedder has built-in per-dim defaults and bootstrap does not set the
+  global provider env var, so declaring it under `requires_env` made
+  plugin loading stricter than the runtime actually needs. `PG_MEM_DB_CONN_STR`
+  remains the only required env var; legacy `POSTGRES_*` still works through
+  the v1.5 compatibility shim.
+- **Module docstring now documents `PG_MEM_DB_CONN_STR` as the primary
+  database config** instead of presenting the deprecated `POSTGRES_*` vars as
+  the main path.
+- **README markdown typo fixed** in the first-time install section
+  (`KIMI_API_KEY=***` now closes its inline-code span correctly).
+
 ## 1.5.0 (2026-06-03)
 
 ### Changed

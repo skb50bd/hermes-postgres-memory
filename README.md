@@ -25,7 +25,7 @@ It will ask you for:
 - Your **Postgres superuser** password (one-time, to create the role + DB)
 - A password for the new `hermes` role (the plugin authenticates as this)
 
-After it finishes, edit `~/.hermes/.env` to uncomment `KIMI_API_KEY=*** and
+After it finishes, edit `~/.hermes/.env` to uncomment `KIMI_API_KEY=***` and
 add your key (free at https://platform.moonshot.cn), then restart the
 gateway:
 

@@ -17,11 +17,10 @@ agent_memory table with:
   fallback vectors are NOT cached (defense against cache poisoning).
 
 Config via environment variables:
-    POSTGRES_HOST      — Database host (default: localhost)
-    POSTGRES_PORT      — Database port (default: 5432)
-    POSTGRES_USER      — Database user (default: hermes)
-    POSTGRES_PASSWORD  — Database password (required)
-    POSTGRES_DATABASE  — Database name (default: hermes)
+    PG_MEM_DB_CONN_STR — PostgreSQL libpq DSN (preferred), e.g.
+                         postgresql://hermes:***@host:5432/hermes
+    POSTGRES_HOST / POSTGRES_PORT / POSTGRES_USER / POSTGRES_PASSWORD /
+    POSTGRES_DATABASE — legacy fallback accepted until v2.0
     HERMES_EMBED_DEFAULT_DIM — Override default dim if SQL is unavailable
     HERMES_EMBED_PROVIDER_<DIM> / HERMES_EMBED_MODEL_<DIM> /
     HERMES_EMBED_BASE_URL_<DIM> / HERMES_EMBED_API_KEY_<DIM> — per-dim

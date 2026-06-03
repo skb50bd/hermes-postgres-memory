@@ -533,11 +533,11 @@ endpoint details.
 
 | Var | Default | Purpose |
 |---|---|---|
-| `HERMES_EMBED_PROVIDER` | `kimi` | One of `kimi`, `ollama_cloud`, `ollama_local`, `noop` |
+| `HERMES_EMBED_PROVIDER` | `kimi` | One of `kimi`, `minimax`, `ollama_cloud`, `ollama_local`, `noop` |
 | `HERMES_EMBED_MODEL` | `bge_m3_embed` | Model passed to the provider |
 | `HERMES_EMBED_DIM` | `1024` | Must match `agent_memory.content_vector` dim |
-| `HERMES_EMBED_BASE_URL` | `https://api.kimi.com/coding/v1` (kimi) / `https://ollama.com` (cloud) / `http://localhost:11434` (local) | Provider API base |
-| `HERMES_EMBED_API_KEY` | unset | Explicit key. If unset, falls back to `KIMI_API_KEY` for kimi, `OLLAMA_API_KEY` for ollama_* |
+| `HERMES_EMBED_BASE_URL` | `https://api.kimi.com/coding/v1` (kimi) / `https://api.minimax.io/v1` (minimax) / `https://ollama.com` (cloud) / `http://localhost:11434` (local) | Provider API base |
+| `HERMES_EMBED_API_KEY` | unset | Explicit key. If unset, falls back to `KIMI_API_KEY` for kimi, `MINIMAX_API_KEY` for minimax, `OLLAMA_API_KEY` for ollama_* |
 | `HERMES_EMBED_TIMEOUT` | `10` | HTTP timeout, seconds |
 | `HERMES_EMBED_CACHE_DIR` | `~/.cache/hermes/embeddings` | Disk cache root (sharded by first 2 hex chars of content hash) |
 | `HERMES_EMBED_CACHE` | `1` | Set to `0` to disable disk cache (in-memory always on per process) |
@@ -565,18 +565,22 @@ below).
 |---|---|---|---|---|
 | `kimi` (`bge_m3_embed`) | ✅ | 1024 | Top-tier MTEB, multilingual, BAAI flagship | Recommended default. Moonshot/Kimi serves it at `api.kimi.com/coding/v1`. Same model as Ollama's `bge-m3` for self-host. |
 | `kimi` (`bge-large`, `bge-large-en`, `nomic-embed-text`, `text-embedding-3-small`, …) | ✅ | 1024 | varies | Kimi's endpoint accepts 9+ model-name aliases but all return 1024-dim; the alias is a quality/style choice only |
+| `minimax` (`embo-01`) | ❌ (paid subscription) | 1536 | Strong MTEB; MiniMax's flagship embedding | **Default for 1536-dim.** MiniMax's OpenAI-compatible endpoint at `https://api.minimax.io/v1/embeddings`. Same HTTP contract as Kimi; `MINIMAX_API_KEY` is the env var. Wire `MINIMAX_API_KEY=sk-...` in `.env` to enable. |
 | `ollama_local` (`bge-m3` or `nomic-embed-text`) | ✅ | 1024 / 768 | matches Kimi | Self-host: `ollama pull bge-m3` (or `nomic-embed-text`). Same HTTP contract as `kimi` but different path. |
 | `ollama_cloud` | ❌ | n/a | n/a | **Ollama Cloud's public model catalog is currently chat-only.** No embedding models are provisioned, and `/api/embed` returns 401. Don't use this provider. |
 | `noop` | ✅ | any | n/a | Test/fallback only |
 
-**Why Kimi is the default**: as of June 2026, Kimi's
+**Why Kimi is the default for 1024-dim** and **MiniMax is the default
+for 1536-dim**: as of June 2026, Kimi's
 `https://api.kimi.com/coding/v1/embeddings` is the only free, working
-embedding endpoint among the providers with keys in our `.env`. Ollama
-Cloud's free tier does not serve embedding models, Moonshot's
-`api.moonshot.cn/v1` rejects the same key, and OpenAI's `text-embedding-3-*`
-is paid.
+1024-dim endpoint with a key in our `.env`. Ollama Cloud's free tier
+does not serve embedding models, Moonshot's `api.moonshot.cn/v1`
+rejects the same key, and OpenAI's `text-embedding-3-*` is paid.
+For 1536-dim, MiniMax's `embo-01` is the recommended paid option —
+the user's MiniMax subscription is the cheapest path to true
+1536-dim vectors without the OpenAI bill.
 
-The Kimi endpoint is OpenAI-shape: `POST /v1/embeddings` with
+The Kimi and MiniMax endpoints are both OpenAI-shape: `POST /v1/embeddings` with
 `{"model": ..., "input": ...}` returning `{"data": [{"embedding": [...]}]}`.
 The embedder's `_embed_openai_compat` helper handles this and is also
 reusable for OpenRouter, Together, vLLM, and any other OpenAI-compatible

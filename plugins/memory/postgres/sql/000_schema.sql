@@ -6,7 +6,7 @@
 -- The plugin supports three embedding dimensions out of the box:
 --   - 768  (nomic-embed-text / bge-small)
 --   - 1024 (BGE-M3 / bge-m3 — Kimi default)
---   - 1536 (OpenAI text-embedding-3-small)
+--   - 1536 (MiniMax embo-01, or OpenAI text-embedding-3-small with override)
 --
 -- All three vector columns are present, all nullable, all indexed.
 -- A row can have any subset of them populated. The plugin writes to
@@ -112,13 +112,16 @@ CREATE TABLE IF NOT EXISTS agent_memory_models (
 INSERT INTO agent_memory_models (dim, provider, model, api_key_env) VALUES
     (768,  'ollama_local', 'nomic-embed-text', 'OLLAMA_API_KEY'),
     (1024, 'kimi',         'bge_m3_embed',     'KIMI_API_KEY'),
-    (1536, 'kimi',         'text-embedding-3-small', 'KIMI_API_KEY')
+    (1536, 'minimax',      'embo-01',          'MINIMAX_API_KEY')
 ON CONFLICT (dim) DO NOTHING;
--- Note: row 1536 points at kimi/bge_m3_embed for free use; if you
--- have an OpenAI key and want true 1536-dim OpenAI vectors, run:
---   hermes postgres-memory model-set --dim 1536 --provider openai --model text-embedding-3-small --api-key-env OPENAI_API_KEY
--- (This requires wiring the openai provider into the embedder; for
--- now the embedder supports kimi / ollama_local / ollama_cloud / noop.)
+-- Notes:
+--   1536: default points at minimax/embo-01 (https://api.minimax.io/v1).
+--         Set MINIMAX_API_KEY in ~/.hermes/.env to use the default.
+--   If you have an OpenAI key and want their text-embedding-3-small
+--   instead, run:
+--     hermes postgres-memory model-set --dim 1536 --provider openai --model text-embedding-3-small --api-key-env OPENAI_API_KEY
+--   (Requires the openai provider to be wired in — currently the
+--   embedder supports kimi / minimax / ollama_local / ollama_cloud / noop.)
 
 -- The default dim the plugin writes to and searches on. Switch
 -- with `hermes postgres-memory model-set --dim <768|1024|1536>`.

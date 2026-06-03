@@ -52,7 +52,7 @@ def embedder_module(monkeypatch):
                    "HERMES_EMBED_PROVIDER", "HERMES_EMBED_MODEL",
                    "HERMES_EMBED_DIM", "HERMES_EMBED_TIMEOUT", "HERMES_EMBED_CACHE",
                    "HERMES_EMBED_FAIL_OPEN", "HERMES_EMBED_CACHE_DIR",
-                   "KIMI_API_KEY", "OLLAMA_API_KEY"):
+                   "KIMI_API_KEY", "OLLAMA_API_KEY", "MINIMAX_API_KEY"):
         monkeypatch.delenv(prefix, raising=False)
     import embedder as em
     em.reset_embedder()  # clear any prior singleton
@@ -65,10 +65,11 @@ def test_default_per_dim_models(embedder_module, monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_EMBED_CACHE", "0")
     monkeypatch.setenv("KIMI_API_KEY", "k")
     monkeypatch.setenv("OLLAMA_API_KEY", "o")
+    monkeypatch.setenv("MINIMAX_API_KEY", "m")
     for d, expected_provider, expected_model in [
         (768, "ollama_local", "nomic-embed-text"),
         (1024, "kimi", "bge_m3_embed"),
-        (1536, "kimi", "text-embedding-3-small"),
+        (1536, "minimax", "embo-01"),
     ]:
         cfg = embedder_module._default_model_config_for_dim(d)
         assert cfg["dim"] == d
@@ -387,3 +388,178 @@ def test_kimi_openai_shape_response_parser(embedder_module, monkeypatch, tmp_pat
     v = e.embed("first")
     assert len(v) == EMBED_DIM_1024
     assert v[0] == 0.1
+
+
+# ── minimax provider tests ───────────────────────────────────────────────
+
+def test_minimax_default_per_dim_config(embedder_module, monkeypatch, tmp_path):
+    """1536-dim default is now minimax/embo-01. The default config
+    must read MINIMAX_API_KEY from env (not KIMI_API_KEY or OLLAMA_API_KEY)."""
+    monkeypatch.setenv("HERMES_EMBED_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("MINIMAX_API_KEY", "minimax-test-key")
+    cfg = embedder_module._default_model_config_for_dim(1536)
+    assert cfg["provider"] == "minimax"
+    assert cfg["model"] == "embo-01"
+    assert cfg["api_key"] == "minimax-test-key"
+
+
+def test_minimax_api_key_resolution_chain(embedder_module, monkeypatch):
+    """API key resolution for the minimax provider: per-dim env wins
+    over shared, which wins over MINIMAX_API_KEY (provider-specific)."""
+    from embedder import _resolve_api_key
+    # 1. Per-dim explicit wins
+    monkeypatch.setenv("HERMES_EMBED_API_KEY_1536", "explicit-dim")
+    monkeypatch.setenv("HERMES_EMBED_API_KEY", "shared")
+    monkeypatch.setenv("MINIMAX_API_KEY", "minimax-default")
+    assert _resolve_api_key(1536, "minimax") == "explicit-dim"
+    # 2. Shared env next
+    monkeypatch.delenv("HERMES_EMBED_API_KEY_1536")
+    assert _resolve_api_key(1536, "minimax") == "shared"
+    # 3. Provider-specific (MINIMAX_API_KEY)
+    monkeypatch.delenv("HERMES_EMBED_API_KEY")
+    assert _resolve_api_key(1536, "minimax") == "minimax-default"
+    # 4. KIMI_API_KEY must NOT leak into the minimax provider
+    monkeypatch.setenv("KIMI_API_KEY", "kimi")
+    assert _resolve_api_key(1536, "minimax") == "minimax-default"
+
+
+def test_minimax_live_call_hits_api_minimax_io(embedder_module, monkeypatch, tmp_path):
+    """The minimax provider must POST to https://api.minimax.io/v1/embeddings
+    with the Moonshot-style body shape (`texts` array, not OpenAI's
+    `input` string), sending the right auth header."""
+    monkeypatch.setenv("HERMES_EMBED_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("HERMES_EMBED_CACHE", "0")
+    monkeypatch.setenv("MINIMAX_API_KEY", "minimax-test-key")
+    cfg = embedder_module._default_model_config_for_dim(1536)
+    assert cfg["api_key"] == "minimax-test-key"
+
+    e = embedder_module.Embedder(dim=1536, provider=cfg["provider"],
+                                  model=cfg["model"], api_key=cfg["api_key"],
+                                  cache_dir=str(tmp_path), cache_enabled=False)
+
+    captured = {}
+
+    class FakeResp:
+        status_code = 200
+        def json(self):
+            return {
+                "vectors": [[0.5] * EMBED_DIM_1536],
+                "base_resp": {"status_code": 0, "status_msg": "success"},
+            }
+
+    class FakeClient:
+        def __init__(self, *a, **kw): captured["timeout"] = kw.get("timeout")
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def post(self, url, headers=None, json=None):
+            captured["url"] = url
+            captured["headers"] = headers
+            captured["body"] = json
+            return FakeResp()
+
+    monkeypatch.setattr(embedder_module, "_httpx", type("H", (), {"Client": FakeClient}))
+    v = e.embed("hello")
+    assert v == [0.5] * EMBED_DIM_1536
+    assert captured["url"] == "https://api.minimax.io/v1/embeddings"
+    assert captured["headers"]["Authorization"] == "Bearer minimax-test-key"
+    # Moonshot-style: `texts` (array) not `input` (string)
+    assert captured["body"] == {"model": "embo-01", "texts": ["hello"]}
+
+
+def test_minimax_error_envelope_surfaces_as_embedding_error(embedder_module, monkeypatch, tmp_path):
+    """MiniMax's error responses look like a successful envelope
+    (top-level `vectors` key, with `base_resp.status_code != 0`).
+    The parser must detect this and raise EmbeddingError, NOT fall
+    through to the shape-unknown error path."""
+    e = embedder_module.Embedder(dim=1536, provider="minimax", model="embo-01",
+                                  api_key="k", cache_dir=str(tmp_path),
+                                  cache_enabled=False, fail_open=False)
+    captured = {}
+
+    class FakeResp:
+        status_code = 200
+        def json(self):
+            return {
+                "vectors": None,
+                "base_resp": {"status_code": 2013,
+                              "status_msg": "invalid params"},
+            }
+
+    class FakeClient:
+        def __init__(self, *a, **kw): pass
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def post(self, url, headers=None, json=None):
+            return FakeResp()
+
+    monkeypatch.setattr(embedder_module, "_httpx", type("H", (), {"Client": FakeClient}))
+    with pytest.raises(embedder_module.EmbeddingError, match="2013.*invalid params"):
+        e.embed("hello")
+
+
+def test_kimi_openai_shape_still_works(embedder_module, monkeypatch, tmp_path):
+    """Adding the Moonshot-style `base_resp` error check must NOT
+    break Kimi's OpenAI-shape success path. Kimi returns no
+    `base_resp` on success — the parser should fall through to the
+    `data[0].embedding` branch unchanged."""
+    e = embedder_module.Embedder(dim=1024, provider="kimi", model="bge_m3_embed",
+                                  api_key="k", cache_dir=str(tmp_path),
+                                  cache_enabled=False)
+
+    class FakeResp:
+        status_code = 200
+        def json(self):
+            return {"data": [{"index": 0, "embedding": [0.42] * EMBED_DIM_1024}]}
+
+    class FakeClient:
+        def __init__(self, *a, **kw): pass
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def post(self, url, headers=None, json=None):
+            return FakeResp()
+
+    monkeypatch.setattr(embedder_module, "_httpx", type("H", (), {"Client": FakeClient}))
+    v = e.embed("hello")
+    assert v == [0.42] * EMBED_DIM_1024
+
+
+def test_minimax_uses_configured_base_url_override(embedder_module, monkeypatch, tmp_path):
+    """HERMES_EMBED_BASE_URL_1536 must override the default minimax base URL."""
+    monkeypatch.setenv("HERMES_EMBED_BASE_URL_1536", "https://minimax-proxy.example.com/v1")
+    monkeypatch.setenv("HERMES_EMBED_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("MINIMAX_API_KEY", "k")
+    cfg = embedder_module._default_model_config_for_dim(1536)
+    assert cfg["base_url"] == "https://minimax-proxy.example.com/v1"
+
+    e = embedder_module.Embedder(dim=1536, provider="minimax", model="embo-01",
+                                  api_key="k", base_url=cfg["base_url"],
+                                  cache_dir=str(tmp_path), cache_enabled=False)
+    captured = {}
+
+    class FakeResp:
+        status_code = 200
+        def json(self):
+            return {"data": [{"embedding": [0.1] * EMBED_DIM_1536}]}
+
+    class FakeClient:
+        def __init__(self, *a, **kw): pass
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def post(self, url, headers=None, json=None):
+            captured["url"] = url
+            return FakeResp()
+
+    monkeypatch.setattr(embedder_module, "_httpx", type("H", (), {"Client": FakeClient}))
+    e.embed("hi")
+    assert captured["url"] == "https://minimax-proxy.example.com/v1/embeddings"
+
+
+def test_minimax_dim_mismatch_surfaces_as_error(embedder_module, monkeypatch, tmp_path):
+    """If minimax returns the wrong dim (e.g. model swap), the embedder
+    must fail open to a zero vector (or raise if fail_open is False)."""
+    e = embedder_module.Embedder(dim=1536, provider="minimax", model="embo-01",
+                                  api_key="k", cache_dir=str(tmp_path),
+                                  cache_enabled=False, fail_open=False)
+    with patch.object(e, "_embed_live", return_value=[0.0] * 1024):
+        with pytest.raises(embedder_module.EmbeddingError, match="dim mismatch"):
+            e.embed("mismatch")

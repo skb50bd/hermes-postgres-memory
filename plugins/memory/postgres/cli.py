@@ -137,11 +137,20 @@ def cmd_model_set(args, parser) -> int:
     Examples:
         hermes postgres-memory model-set --dim 768
         hermes postgres-memory model-set --dim 1024 --provider kimi --model bge_m3_embed
-        hermes postgres-memory model-set --dim 1536 --provider kimi --model text-embedding-3-small
+        hermes postgres-memory model-set --dim 1536 --provider minimax --model embo-01
     """
     if args.dim not in (768, 1024, 1536):
         print(f"Invalid --dim: {args.dim}. Use 768, 1024, or 1536.", file=sys.stderr)
         return 2
+    # Default provider/model/api-key-env per dim. Used when the row
+    # is missing and the user didn't pass --provider/--model. Aligned
+    # with the SQL registry defaults in sql/000_schema.sql.
+    defaults_by_dim = {
+        768:  ("ollama_local", "nomic-embed-text", "OLLAMA_API_KEY"),
+        1024: ("kimi",         "bge_m3_embed",     "KIMI_API_KEY"),
+        1536: ("minimax",      "embo-01",          "MINIMAX_API_KEY"),
+    }
+    default_provider, default_model, default_api_key_env = defaults_by_dim[args.dim]
     conn = _conn()
     try:
         with conn.cursor() as cur:
@@ -163,7 +172,9 @@ def cmd_model_set(args, parser) -> int:
                 if row:
                     new_provider, new_model = row
                 else:
-                    # Insert a new row for this dim
+                    # Insert a new row for this dim. Use the dim's
+                    # default provider/model/api-key-env (aligned
+                    # with sql/000_schema.sql).
                     cur.execute(
                         "INSERT INTO agent_memory_models (dim, provider, model, api_key_env) "
                         "VALUES (%s, %s, %s, %s) "
@@ -171,8 +182,10 @@ def cmd_model_set(args, parser) -> int:
                         "  provider = EXCLUDED.provider, model = EXCLUDED.model, "
                         "  updated_at = now() "
                         "RETURNING provider, model",
-                        (args.dim, args.provider or "kimi", args.model or "bge_m3_embed",
-                         "KIMI_API_KEY"),
+                        (args.dim,
+                         args.provider or default_provider,
+                         args.model or default_model,
+                         default_api_key_env),
                     )
                     new_provider, new_model = cur.fetchone()
             else:

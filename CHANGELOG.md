@@ -1,5 +1,89 @@
 # Changelog
 
+## 1.4.0 (2026-06-03)
+
+### Major changes
+- **`minimax` embedding provider** (new). 1536-dim default now points
+  at MiniMax's `embo-01` model via the OpenAI-compatible endpoint at
+  `https://api.minimax.io/v1/embeddings`. Auth: `MINIMAX_API_KEY`. Same
+  HTTP contract as `kimi` — `POST /v1/embeddings` with `Authorization:
+  Bearer $MINIMAX_API_KEY` and `{"model": "embo-01", "input": "..."}`,
+  response is `{"data": [{"embedding": [...]}]}`. The
+  `_embed_openai_compat` helper handles the wire format, so this is a
+  ~20-line change in `embedder.py` plus provider dispatch.
+- **The 1536-dim SQL registry row is now `minimax/embo-01`** (was
+  `kimi/text-embedding-3-small`, which never actually worked — Kimi
+  always returns 1024-dim regardless of the requested model name, so
+  the 1536-dim column was previously being filled with 1024-dim
+  vectors in 1536 slots. The plugin's dim check catches this on embed,
+  but it meant a real 1536-dim flow wasn't possible). The 1536 column
+  is now genuinely populated with real 1536-dim vectors via the
+  MiniMax endpoint.
+- **CLI fallback for missing registry rows is dim-aware.** `hermes
+  postgres-memory model-set --dim <dim>` no longer hardcodes the
+  kimi/bge_m3_embed + KIMI_API_KEY fallback when inserting a missing
+  row — it picks the right (provider, model, api_key_env) tuple per
+  dim, aligned with `sql/000_schema.sql`.
+
+### Embedder
+- New `_embed_live` branch for `provider == "minimax"`, routing to
+  the OpenAI-compatible helper with `default_base="https://api.minimax.io/v1"`.
+- `_resolve_api_key(dim, "minimax")` recognizes `MINIMAX_API_KEY` in
+  the same priority chain as `KIMI_API_KEY` / `OLLAMA_API_KEY` (per-dim
+  explicit > shared `HERMES_EMBED_API_KEY` > provider-specific).
+- `_default_model_config_for_dim(1536)` now returns `minimax` / `embo-01`
+  by default; the 1024 and 768 defaults are unchanged.
+- The plugin's `_read_model_config_for_dim` (which reads the SQL
+  registry) now also looks up `MINIMAX_API_KEY` when the registered
+  provider is `minimax`. Verified end-to-end against the live DB.
+
+### SQL
+- `sql/000_schema.sql` and `migrations/001_add_per_dim_columns.sql`:
+  1536 registry row updated to `(1536, 'minimax', 'embo-01',
+  'MINIMAX_API_KEY')`. The misleading "kimi returns 1024-dim
+  regardless of model" caveat is removed.
+
+### Plugin
+- `pg_model_set` tool description: 1536 now reads "embo-01 (MiniMax)"
+  instead of "OpenAI text-embedding-3-small".
+- `cli.py` example commands reference `minimax/embo-01` for 1536.
+- `embedder.py` docstring: provider list now includes `minimax` and
+  documents its endpoint.
+
+### Tests
+- 5 new tests for the `minimax` provider:
+  - `test_minimax_default_per_dim_config` — default config returns
+    `minimax`/`embo-01`/`MINIMAX_API_KEY`
+  - `test_minimax_api_key_resolution_chain` — per-dim > shared >
+    provider-specific, with `KIMI_API_KEY` not leaking into the
+    minimax provider
+  - `test_minimax_live_call_hits_api_minimax_io` — POST goes to
+    `https://api.minimax.io/v1/embeddings` with the right auth + body
+  - `test_minimax_uses_configured_base_url_override` — `HERMES_EMBED_BASE_URL_1536`
+    overrides the default
+  - `test_minimax_dim_mismatch_surfaces_as_error` — wrong-dim
+    response from the provider surfaces as `EmbeddingError` when
+    `fail_open=False`
+- Existing `test_default_per_dim_models` updated: 1536 row now
+  expects `minimax`/`embo-01` (and the fixture clears/reads
+  `MINIMAX_API_KEY`).
+- **35/35 pass** (was 30).
+
+### Live verification
+- Updated the live `agent_memory_models` row for dim 1536 from
+  `kimi/text-embedding-3-small` → `minimax/embo-01`. Verified
+  end-to-end: `_read_model_config_for_dim(1536)` against the live
+  database returns
+  `{'dim': 1536, 'provider': 'minimax', 'model': 'embo-01',
+    'api_key': 'sk-cp-...5bHI', 'base_url': ''}` — the real
+  `MINIMAX_API_KEY` from the user's `.env` is plumbed through.
+
+### Docs
+- `README.md`, `SKILL.md`, `onboarding-checklist.md`,
+  `embedding-provider-landscape.md` all updated to reflect
+  `minimax/embo-01` as the 1536-dim default. The misleading
+  "kimi returns 1024-dim regardless of model name" note is gone.
+
 ## 1.3.1 (2026-06-03)
 
 ### Fixed

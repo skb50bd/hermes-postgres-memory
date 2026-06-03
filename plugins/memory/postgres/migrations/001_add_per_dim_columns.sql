@@ -59,7 +59,7 @@ CREATE TABLE IF NOT EXISTS agent_memory_models (
 INSERT INTO agent_memory_models (dim, provider, model, api_key_env) VALUES
     (768,  'ollama_local', 'nomic-embed-text',  'OLLAMA_API_KEY'),
     (1024, 'kimi',         'bge_m3_embed',      'KIMI_API_KEY'),
-    (1536, 'kimi',         'text-embedding-3-small', 'KIMI_API_KEY')
+    (1536, 'minimax',      'embo-01',           'MINIMAX_API_KEY')
 ON CONFLICT (dim) DO NOTHING;
 
 -- Default dim. The plugin reads this on init.

@@ -10,9 +10,10 @@ Why per-dim
 -----------
 Different providers serve different dims. Kimi's free endpoint
 serves 1024-dim vectors regardless of model alias. Ollama local can
-serve 768 (nomic-embed-text) or 1024 (bge-m3). OpenAI serves 1536
-(text-embedding-3-small) or 3072. The plugin handles three dims
-(768, 1024, 1536) out of the box and lets the user switch.
+serve 768 (nomic-embed-text) or 1024 (bge-m3). MiniMax serves 1536
+(embo-01). OpenAI serves 1536 (text-embedding-3-small) or 3072.
+The plugin handles three dims (768, 1024, 1536) out of the box and
+lets the user switch.
 
 Configuration
 -------------
@@ -32,6 +33,13 @@ Supported providers
 - ``kimi`` (default for 1024-dim): Moonshot/Kimi's OpenAI-compatible
   embedding endpoint at https://api.kimi.com/coding/v1. Free with the
   KIMI_API_KEY already in .env. Returns 1024-dim, L2-normalized.
+- ``minimax`` (default for 1536-dim): MiniMax's OpenAI-compatible
+  embedding endpoint at https://api.minimax.io/v1. Returns 1536-dim
+  via the ``embo-01`` model. Same HTTP contract as ``kimi`` —
+  POST ``/embeddings`` with ``Authorization: Bearer $MINIMAX_API_KEY``
+  and ``{"model": "embo-01", "input": "..."}``, response is
+  ``{"data": [{"embedding": [...]}]}``. Useful when a MiniMax
+  subscription is the preferred (or only available) embedding source.
 - ``ollama_local``: self-hosted Ollama. Run `ollama pull bge-m3` for
   1024-dim or `ollama pull nomic-embed-text` for 768-dim.
 - ``ollama_cloud``: Ollama Cloud's /api/embed. Free tier is currently
@@ -263,11 +271,26 @@ class Embedder:
                 text_payload_key="input",
                 text_payload_value=text,
             )
+        if provider == "minimax":
+            # MiniMax's https://api.minimax.io/v1/embeddings is
+            # Moonshot-style, not OpenAI-style. The request body uses
+            # `texts` (array of strings) instead of `input` (single
+            # string), and the response is `{"vectors": [[...]],
+            # "base_resp": {...}}` — the same `vectors` shape that
+            # the parser already handles in the ollama-style fallback.
+            # Default model is embo-01, which is the only embedding
+            # model in the MiniMax catalog as of June 2026 (1536-dim).
+            return self._embed_openai_compat(
+                default_base="https://api.minimax.io/v1",
+                path="/embeddings",
+                text_payload_key="texts",
+                text_payload_value=[text],
+            )
         if provider in ("ollama_cloud", "ollama_local"):
             return self._embed_ollama(text)
         raise EmbeddingError(
             f"Unknown embedding provider: {provider!r}. "
-            f"Set HERMES_EMBED_PROVIDER to one of: kimi, ollama_local, ollama_cloud, noop."
+            f"Set HERMES_EMBED_PROVIDER to one of: kimi, minimax, ollama_local, ollama_cloud, noop."
         )
 
     def _embed_openai_compat(
@@ -293,6 +316,19 @@ class Embedder:
                 f"Embed endpoint returned {resp.status_code}: {resp.text[:300]}"
             )
         data = resp.json()
+        # Moonshot-style (used by kimi, minimax) returns
+        # `{"vectors": [[...]], "base_resp": {"status_code": 0, ...}}`
+        # on success and `{"vectors": None, "base_resp": {"status_code":
+        # 2013, "status_msg": "..."}}` on error. The error envelope
+        # looks like a successful response at the top level, so we
+        # must check `base_resp.status_code` first.
+        if "base_resp" in data and isinstance(data["base_resp"], dict):
+            base = data["base_resp"]
+            status_code = base.get("status_code", 0)
+            if status_code != 0:
+                raise EmbeddingError(
+                    f"Embed endpoint error {status_code}: {base.get('status_msg', 'unknown')}"
+                )
         if "data" in data and data["data"]:
             vec = data["data"][0].get("embedding")
             if vec is None:
@@ -440,9 +476,9 @@ def _default_model_config_for_dim(dim: int) -> dict:
     if dim == 1536:
         return {
             "dim": 1536,
-            "provider": os.environ.get("HERMES_EMBED_PROVIDER_1536", "kimi"),
-            "model": os.environ.get("HERMES_EMBED_MODEL_1536", "text-embedding-3-small"),
-            "api_key": _resolve_api_key(1536, "kimi"),
+            "provider": os.environ.get("HERMES_EMBED_PROVIDER_1536", "minimax"),
+            "model": os.environ.get("HERMES_EMBED_MODEL_1536", "embo-01"),
+            "api_key": _resolve_api_key(1536, "minimax"),
             "base_url": os.environ.get("HERMES_EMBED_BASE_URL_1536", ""),
             "cache_dir": cache_dir,
         }
@@ -459,6 +495,8 @@ def _resolve_api_key(dim: int, provider: str) -> str:
         return shared
     if provider == "kimi":
         return os.environ.get("KIMI_API_KEY", "").strip()
+    if provider == "minimax":
+        return os.environ.get("MINIMAX_API_KEY", "").strip()
     if provider in ("ollama_cloud", "ollama_local"):
         return os.environ.get("OLLAMA_API_KEY", "").strip()
     return ""

@@ -256,6 +256,8 @@ def _read_model_config_for_dim(dim: int) -> dict:
             api_key = os.environ.get("HERMES_EMBED_API_KEY", "").strip()
         if not api_key and provider == "kimi":
             api_key = os.environ.get("KIMI_API_KEY", "").strip()
+        if not api_key and provider == "minimax":
+            api_key = os.environ.get("MINIMAX_API_KEY", "").strip()
         if not api_key and provider in ("ollama_local", "ollama_cloud"):
             api_key = os.environ.get("OLLAMA_API_KEY", "").strip()
         return {
@@ -642,7 +644,7 @@ MODEL_SET_SCHEMA = {
         "type": "object",
         "properties": {
             "dim": {"type": "integer", "enum": [768, 1024, 1536],
-                    "description": "The new default dim. 768=nomic-embed-text (Ollama), 1024=bge-m3 (Kimi), 1536=OpenAI text-embedding-3-small."},
+                    "description": "The new default dim. 768=nomic-embed-text (Ollama), 1024=bge_m3_embed (Kimi), 1536=embo-01 (MiniMax)."},
             "provider": {"type": "string",
                          "description": "Override the provider for this dim. Defaults to the SQL-registered value."},
             "model": {"type": "string",

@@ -11,7 +11,8 @@ Need embeddings, want free, want working today?
 ├── Yes, and you have a KIMI_API_KEY   → kimi provider, bge_m3_embed (1024-dim)
 ├── Yes, willing to self-host          → ollama_local, bge-m3 (1024-dim)
 │                                       or nomic-embed-text (768-dim)
-├── No, willing to pay                 → openai text-embedding-3-small (1536-dim)
+├── No, willing to pay, have MiniMax   → minimax provider, embo-01 (1536-dim)
+├── No, willing to pay, want OpenAI    → openai text-embedding-3-small (1536-dim, not yet wired)
 └── Test / fallback                    → noop (zero vector)
 ```
 
@@ -20,9 +21,10 @@ Need embeddings, want free, want working today?
 | Provider | Endpoint | Free? | Works? | Dim | Notes |
 |---|---|---|---|---|---|
 | `kimi` (Moonshot/Kimi) | `https://api.kimi.com/coding/v1/embeddings` | ✅ | ✅ | 1024 | OpenAI-shape. 9+ model-name aliases all return 1024-dim, L2-normalized. `bge_m3_embed` is the BGE-M3 weights, same as Ollama's `bge-m3`. |
+| `minimax` (MiniMax) | `https://api.minimax.io/v1/embeddings` | ❌ (paid subscription) | ✅ | 1536 | OpenAI-shape. `embo-01` is the only embedding model in the catalog. **Default for 1536-dim.** |
 | `ollama_cloud` | `https://ollama.com/api/embed` | "free tier" | ❌ | n/a | `/api/tags` returns 40 chat models, zero embed models. `/api/pull nomic-embed-text` → `404 model not found`. `/api/embed` → `401 unauthorized` even with valid key. Ollama Cloud's public catalog is **chat-only**. |
 | `ollama_local` | `http://localhost:11434/api/embed` | ✅ | ✅ | model-dependent | Same HTTP contract as ollama_cloud but self-hosted. `ollama pull bge-m3` or `ollama pull nomic-embed-text`. |
-| `openai` (not yet wired) | `https://api.openai.com/v1/embeddings` | ❌ ~$0.02/1M tok | ✅ | 1536 | `text-embedding-3-small` is the cost-effective default. |
+| `openai` (not yet wired) | `https://api.openai.com/v1/embeddings` | ❌ ~$0.02/1M tok | ✅ | 1536 | `text-embedding-3-small` is the cost-effective default. To enable: add a new provider dispatch in `embedder.py` and override the 1536 row. |
 | `noop` | n/a | ✅ | ✅ | any | Returns a 768/1024-dim zero vector. For tests and as a last-resort fail-safe. |
 
 ## Probe recipe (use this to verify before trusting)

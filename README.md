@@ -85,12 +85,18 @@ hermes postgres-memory backfill --batch 8
 # Use mxbai-embed-large on ollama for 1024-dim
 hermes postgres-memory model-set --dim 1024 --provider ollama_local --model mxbai-embed-large
 
-# Use OpenAI for 1536-dim
+# Use MiniMax for 1536-dim (default — uses the user's MiniMax subscription)
+hermes postgres-memory model-set --dim 1536 --provider minimax --model embo-01
+
+# Use OpenAI for 1536-dim (override)
 hermes postgres-memory model-set --dim 1536 --provider openai --model text-embedding-3-small
 ```
 
-Note: providers other than kimi/ollama_local/ollama_cloud/noop are not
-implemented in `embedder.py` yet. Adding a new provider is ~50 lines: see
+Note: providers other than kimi/minimax/ollama_local/ollama_cloud/noop are
+not implemented in `embedder.py` yet. The `minimax` provider (default
+for 1536-dim) is wired up in 1.4.0 and uses MiniMax's
+`https://api.minimax.io/v1/embeddings` endpoint with the
+`embo-01` model. Adding another provider is ~50 lines: see
 the dispatch in `Embedder._embed_live`.
 
 ---
@@ -120,8 +126,8 @@ agent_memory_settings
 
 agent_memory_models
 ├── dim (smallint, PK)            — 768, 1024, or 1536
-├── provider (text)               — 'kimi', 'ollama_local', 'ollama_cloud', 'noop'
-├── model (text)                  — e.g. 'bge_m3_embed', 'nomic-embed-text'
+├── provider (text)               — 'kimi', 'minimax', 'ollama_local', 'ollama_cloud', 'noop'
+├── model (text)                  — e.g. 'bge_m3_embed', 'nomic-embed-text', 'embo-01'
 ├── base_url (text, nullable)
 └── api_key_env (text, nullable)  — name of the env var holding the API key
 ```
@@ -180,6 +186,7 @@ at the configured default_dim will be searchable.
 | `POSTGRES_PASSWORD` | (required) | |
 | `POSTGRES_DATABASE` | `hermes` | |
 | `KIMI_API_KEY` | (env) | Free 1024-dim embedder. https://platform.moonshot.cn |
+| `MINIMAX_API_KEY` | (env) | 1536-dim embedder (default for the 1536 column). https://api.minimax.io |
 | `OLLAMA_API_KEY` | (env) | Only needed for ollama_cloud |
 | `HERMES_EMBED_PROVIDER_<dim>` | per-dim default | Override provider for a dim |
 | `HERMES_EMBED_MODEL_<dim>` | per-dim default | Override model for a dim |
@@ -198,14 +205,19 @@ at the configured default_dim will be searchable.
 |---|---|---|---|
 | 768 | `ollama_local` | `nomic-embed-text` | `ollama pull nomic-embed-text` |
 | 1024 | `kimi` | `bge_m3_embed` | `KIMI_API_KEY` (https://platform.moonshot.cn, free tier) |
-| 1536 | `kimi` (default) or `openai` | `text-embedding-3-small` | `KIMI_API_KEY` or `OPENAI_API_KEY` |
+| 1536 | `minimax` (default) or `openai` | `embo-01` or `text-embedding-3-small` | `MINIMAX_API_KEY` (default) or `OPENAI_API_KEY` |
 
-To use OpenAI for 1536-dim, run:
+The 1536 default uses the user's MiniMax subscription (`embo-01` model),
+which is the cheapest path to true 1536-dim vectors. To use OpenAI
+instead, run:
+
 ```bash
 hermes postgres-memory model-set --dim 1536 --provider openai --model text-embedding-3-small
 ```
+
 (Note: the `openai` provider is not yet implemented in `embedder.py` —
-use the Kimi 1536 default or open a PR.)
+the plugin currently supports `kimi`, `minimax`, `ollama_local`,
+`ollama_cloud`, and `noop`. Use the MiniMax 1536 default for now.)
 
 ---
 
@@ -253,11 +265,9 @@ you configured is at zero, you need to either:
 
 The embedder fails open to `[0.0] * dim` on provider errors and refuses
 to cache them. Check:
-- `KIMI_API_KEY` is set in the same env Hermes Agent is running in
+- For 1024-dim (default): `KIMI_API_KEY` is set in the same env Hermes Agent is running in
+- For 1536-dim (default): `MINIMAX_API_KEY` is set. MiniMax's `embo-01` model returns 1536-dim native, so this is the real 1536-dim path. (`KIMI_API_KEY` will fail to return true 1536-dim vectors — it always returns 1024-dim regardless of model name.)
 - For Ollama: `curl http://localhost:11434/api/tags` returns your pulled model
-- For 1536-dim: only Kimi is implemented, and Kimi returns 1024-dim
-  regardless of model name. So 1536-dim requires `OPENAI_API_KEY` and
-  the `openai` provider (not yet implemented; use 1024 for now).
 
 ### Old `content_vector` column
 

@@ -121,12 +121,13 @@ box and lets you switch between them at runtime.
 |---|---|---|---|
 | 768 | `ollama_local` / `nomic-embed-text` | `OLLAMA_API_KEY` (only for `ollama_cloud`) | Free, local |
 | 1024 | `kimi` / `bge_m3_embed` | `KIMI_API_KEY` | Free tier |
-| 1536 | `kimi` / `text-embedding-3-small` (returns 1024-dim; OpenAI is the real 1536 path) | `KIMI_API_KEY` (default) or `OPENAI_API_KEY` | Free (default) or paid (OpenAI) |
+| 1536 | `minimax` / `embo-01` | `MINIMAX_API_KEY` | Paid (MiniMax subscription) |
 
 **Default behaviour**: the plugin ships with the Kimi BGE-M3 model for
-1024-dim. The free Kimi tier is enough for a single-user deployment
-(verify the latest rate limits at https://platform.moonshot.cn). If you
-have a Kimi key, that's all you need.
+1024-dim and the MiniMax `embo-01` model for 1536-dim. Both providers
+return their advertised dim natively (1024 from Kimi, 1536 from
+MiniMax). If you have a Kimi key, that's all you need for the
+default 1024-dim; for 1536-dim you'll need a `MINIMAX_API_KEY`.
 
 If you don't have a Kimi key but have Ollama running locally:
 
@@ -139,14 +140,20 @@ ollama pull nomic-embed-text
 hermes postgres-memory model-set --dim 1024 --provider ollama_local --model nomic-embed-text
 ```
 
-If you want 1536-dim with real OpenAI vectors:
+If you want 1536-dim with the user's MiniMax subscription:
+
+```bash
+# Set MINIMAX_API_KEY=sk-cp-... in ~/.hermes/.env, then:
+hermes postgres-memory model-set --dim 1536 --provider minimax --model embo-01
+# Now 1536-dim writes go to vector_1536 via the MiniMax endpoint.
+```
+
+If you want 1536-dim with real OpenAI vectors instead (override):
 
 ```bash
 # (Requires the 'openai' provider to be wired into embedder.py — not yet shipped.)
-# For now, the 1536-dim default uses Kimi, which actually returns 1024-dim
-# vectors regardless of model name. So a '1536' row written via Kimi is
-# actually a 1024-dim vector stored in vector_1536 with a dimension
-# mismatch — DO NOT mix this with real 1536-dim rows.
+# Use the MiniMax default for now. Once the openai provider is added:
+# hermes postgres-memory model-set --dim 1536 --provider openai --model text-embedding-3-small
 ```
 
 ## Python prerequisites (one-time, in the gateway's venv)

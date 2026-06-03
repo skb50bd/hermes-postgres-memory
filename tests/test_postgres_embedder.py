@@ -313,7 +313,7 @@ def test_get_embedder_rejects_unsupported_dim(embedder_module, monkeypatch):
 
 def test_supported_dims_constant(embedder_module):
     """SUPPORTED_DIMS is the canonical list — adding a dim requires code
-    + migration + test changes, not just an env var."""
+    + schema + test changes, not just an env var."""
     assert embedder_module.SUPPORTED_DIMS == (768, 1024, 1536)
 
 

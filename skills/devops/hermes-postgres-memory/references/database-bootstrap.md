@@ -12,7 +12,7 @@ the bootstrap script is failing and you want to understand why.
 | A `vector` extension | pgvector is what makes the per-dim columns indexable and queryable by cosine distance | `000_create_database_and_role.sql` |
 | A database (default: `hermes`) | The plugin connects to one DB; everything lives in the `public` schema | Same file |
 | A role (default: `hermes`) | The plugin authenticates as one role; the role must own the schema to do DDL | Same file |
-| The role owns the `public` schema | `CREATE TABLE` / `CREATE INDEX` are owner-gated, not grant-gated (verified via `aclexplode` — see `migration-privileges.md`) | Same file |
+| The role owns the `public` schema | `CREATE TABLE` / `CREATE INDEX` are owner-gated, not grant-gated | Same file |
 | A connection limit (default: 20) | Prevents a buggy plugin from saturating the server's connection slots | Same file |
 | The role is **not** a superuser | Defense in depth. The plugin never needs DDL on system tables. | (Not enforced by the script — just convention) |
 
@@ -146,7 +146,7 @@ to get them are:
 4. Invoke a `SECURITY DEFINER` function owned by a privileged role
 
 This is verified directly via `aclexplode` on the table's `relacl` —
-see `migration-privileges.md` for the diagnostic query.
+inspect table ownership directly with `pg_class.relowner` if needed.
 
 The `ALTER SCHEMA public OWNER TO hermes;` statement is therefore the
 single most important line in the whole bootstrap. Without it, the

@@ -9,31 +9,21 @@ to. Pass --dim to backfill a specific dim only.
 For each (row, dim) where the target column is null or all-zero, the
 script calls the embedder for that dim and writes the result.
 
-Order of operations (fresh install):
+Order of operations:
     1. psql ... -f sql/000_schema.sql                  # creates all per-dim columns + indexes
     2. python scripts/backfill_embeddings.py           # this file (default: all dims)
-    3. Use the plugin. (No need for `model-set` to switch dims; all
-       three columns are populated. To make a different dim the
-       default, run `hermes postgres-memory model-set --dim <dim>`.)
-
-Order of operations (upgrade from pre-1.2.0):
-    1. psql ... -f migrations/000_grant_ddl_to_hermes.sql  # one-time, as superuser
-    2. psql ... -f migrations/001_add_per_dim_columns.sql  # adds per-dim columns
-    3. psql ... -f migrations/002_hnsw_per_dim.sql          # builds HNSW on each
-    4. psql ... -f migrations/003_migrate_legacy_content_vector.sql  # copies legacy data
-    5. python scripts/backfill_embeddings.py [--dim 1024]   # populate the rest
-    6. (later) psql ... -f migrations/004_drop_legacy_column.sql    # drop legacy col
+    3. Use the plugin. To make a different dim the default, run
+       `hermes postgres-memory model-set --dim <dim>`.
 
 Environment:
-    POSTGRES_HOST / POSTGRES_PORT / POSTGRES_USER / POSTGRES_PASSWORD /
-    POSTGRES_DATABASE — connection
+    PG_MEM_DB_CONN_STR — required PostgreSQL libpq DSN
     HERMES_EMBED_PROVIDER_<DIM> / HERMES_EMBED_MODEL_<DIM> /
     HERMES_EMBED_BASE_URL_<DIM> / HERMES_EMBED_API_KEY_<DIM> — per-dim
     HERMES_EMBED_FAIL_OPEN — global fail-open flag (default: 1)
 
-The script also auto-sources ~/.hermes/.env if KIMI_API_KEY /
-OLLAMA_API_KEY are unset when it starts, so a plain
-`python backfill_embeddings.py` works without `set -a; source ...`.
+The script auto-sources ~/.hermes/.env if PG_MEM_DB_CONN_STR or embedder keys
+are unset, so a plain `python backfill_embeddings.py` works without
+`set -a; source ...`.
 """
 
 from __future__ import annotations
@@ -63,8 +53,10 @@ ENV_FILES = [Path.home() / ".hermes" / ".env"]
 
 
 def _maybe_source_env() -> None:
-    if os.environ.get("KIMI_API_KEY") or os.environ.get("OLLAMA_API_KEY") \
-            or os.environ.get("HERMES_EMBED_API_KEY"):
+    if os.environ.get("PG_MEM_DB_CONN_STR") and (
+        os.environ.get("KIMI_API_KEY") or os.environ.get("OLLAMA_API_KEY")
+        or os.environ.get("MINIMAX_API_KEY") or os.environ.get("HERMES_EMBED_API_KEY")
+    ):
         return
     for path in ENV_FILES:
         if not path.exists():
@@ -84,12 +76,8 @@ def _maybe_source_env() -> None:
 
 
 def _connect():
-    """Build a psycopg2 connection from PG_MEM_DB_CONN_STR (preferred)
-    or the legacy POSTGRES_* vars. The plugin's get_pg_mem_db_conn_str
-    helper handles both forms and emits a one-time deprecation warning
-    on legacy use. Will be removed in v2.0."""
+    """Build a psycopg2 connection from required PG_MEM_DB_CONN_STR."""
     import sys as _sys
-    from urllib.parse import quote
     from psycopg2.extensions import make_dsn
     _HERE = os.path.dirname(os.path.abspath(__file__))
     if _HERE not in _sys.path:

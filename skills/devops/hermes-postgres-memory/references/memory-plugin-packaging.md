@@ -30,10 +30,9 @@ forked maintenance.
    `dim` as a property, don't keep a parallel `_EMBED_DIM = 1024` in
    the plugin's `__init__.py`. Use the embedder's dim everywhere.
 4. **Stale README** — must reflect the current schema, env vars, and
-   migration. A README that says "1536 dims" when the code is
-   1024-dim is worse than no README.
-5. **Missing CHANGELOG.md** — even a one-line "1.1.0 — breaking:
-   1536→1024 schema requires migration" saves users.
+   schema and env contract. A README that describes a removed setup path is worse than no README.
+5. **Public docs must match the current greenfield contract.** Do not ship
+   stale setup notes, removed env vars, or historical prose in user setup docs. Git carries history; docs should describe what works today.
 6. **Author/license/metadata** — match the convention of sibling
    plugins in the same directory. For hermes-agent: `author: "Hermes
    Agent"`, `license: MIT`.
@@ -60,9 +59,7 @@ forked maintenance.
 1. **Packaging destination** — A (upstream), B (PyPI), C (standalone repo).
 2. **Author name in `plugin.yaml`** — the personal brand, the
    company, or upstream's "Hermes Agent".
-3. **Migration policy for users on the old schema** — destructive
-   (DROP+ADD column), non-destructive (sidecar column with
-   union-at-search), or a hard upgrade gate.
+3. **Greenfield policy for stale installs** — destructive reset, explicit unsupported state, or separate import tooling if the user later asks for it.
 
 Don't assume defaults. Each choice has trade-offs the user needs to
 own.
@@ -71,7 +68,7 @@ own.
 
 | Phase | What | Output |
 |---|---|---|
-| 0 — Pre-PR cleanup | Run the 11-issue checklist; rewrite README; centralize hardcoded constants; add CHANGELOG.md | A clean working tree |
+| 0 — Pre-PR cleanup | Run the checklist; rewrite README; centralize hardcoded constants; verify greenfield docs | A clean working tree |
 | 1 — Self-review | Run the full hermes-agent test suite (no leftover state); run linter; test on a dockerized PG 16 | Green CI equivalent |
 | 2 — PR description | State the gap, list what's new, call out breaking changes, include a copy-paste runbook | A PR description reviewers can act on |
 | 3 — Open PR and iterate | Address review comments; expect questions on "why X default" and "what if Y"; merge | 1.1.0 tagged |
@@ -100,7 +97,7 @@ A memory plugin's skill is part of the package. When shipping:
   conventions in ways that would force a fork (different column
   names, different dim, different category table).
 - The plugin is <100 lines and doesn't have its own embedder / SQL
-  / migration. It's not really a plugin yet.
+  / schema. It's not really a plugin yet.
 
 ## Lessons that don't fit in a checklist
 

@@ -1,19 +1,32 @@
-# PostgreSQL Memory Provider for Hermes Agent
+# Hermes Postgres Memory
 
-Vector memory backed by **PostgreSQL + pgvector**. Real embeddings, hybrid
-search (FTS + cosine), categories, tags, JSONB metadata, TTL, soft deletes.
-Free, self-hosted, no per-API-call cost.
+Greenfield PostgreSQL + pgvector memory backend for Hermes Agent.
 
-Supports **3 embedding dims out of the box** — 768, 1024, 1536 — and lets
-you switch between them at runtime via `hermes postgres-memory model-set`.
+It provides:
 
----
+- Hybrid full-text + vector search
+- Runtime-selectable embedding dimensions: 768, 1024, 1536
+- Per-dimension model registry
+- HNSW indexes for every supported vector column
+- Tags, categories, soft deletes, TTL metadata, and status tooling
 
-## 🚀 First-time install (5 minutes)
+This project intentionally documents only the current greenfield install path.
+Git already stores history; users need the current install path, not archaeology.
 
-The one-shot installer handles everything: creates the database + role +
-pgvector extension, installs the plugin + skill, configures `.env` and
-`config.yaml`, runs the preflight. **Idempotent. Re-run any time.**
+## Required environment
+
+Set a single libpq connection string in `~/.hermes/.env`:
+
+```bash
+PG_MEM_DB_CONN_STR='postgresql://hermes:***@10.0.0.1:5432/hermes'
+KIMI_API_KEY='***'
+```
+
+`PG_MEM_DB_CONN_STR` is the only supported application database connection setting.
+It may be a normal URI DSN or a semicolon connection string such as
+`Host=...;Port=5432;Database=hermes;Username=hermes;Password=...`.
+
+## Install
 
 ```bash
 git clone https://github.com/skb50bd/hermes-postgres-memory.git /tmp/hpm
@@ -21,271 +34,95 @@ cd /tmp/hpm
 ./plugins/memory/postgres/scripts/bootstrap.sh
 ```
 
-It will ask you for:
-- Your **Postgres superuser** password (one-time, to create the role + DB)
-- A password for the new `hermes` role (the plugin authenticates as this)
-
-After it finishes, edit `~/.hermes/.env` to uncomment `KIMI_API_KEY=***` and
-add your key (free at https://platform.moonshot.cn), then restart the
-gateway:
+If the database already exists and `~/.hermes/.env` already contains
+`PG_MEM_DB_CONN_STR`, install only the plugin files:
 
 ```bash
-hermes gateway restart
+./install.sh
 ```
 
-**If something fails** before any side effects, run the preflight:
+Then set Hermes to use the provider:
 
-```bash
-./plugins/memory/postgres/scripts/diagnose.sh
+```yaml
+memory:
+  memory_enabled: true
+  provider: postgres
 ```
 
-It walks 16 prerequisites and tells you, in plain language, which are
-missing. For the 5-command TL;DR see
-[`bootstrap-message-short.txt`](bootstrap-message-short.txt). For the
-full walkthrough, see [`bootstrap-message.txt`](bootstrap-message.txt).
+Restart Hermes after changing `.env` or `config.yaml`.
 
----
+## Database schema
 
-## Switching embedding models
+Run `plugins/memory/postgres/sql/000_schema.sql` against the database in
+`PG_MEM_DB_CONN_STR`.
 
-You have three dims. You can switch between them at any time.
+The greenfield schema creates:
 
-### Switch the default dim (one command)
-```bash
-hermes postgres-memory model-set --dim 768
-hermes postgres-memory model-set --dim 1024
-hermes postgres-memory model-set --dim 1536
-```
-
-This updates `agent_memory_settings.default_dim`. New writes go to the new
-column. Old rows that already have a vector at the new dim are immediately
-queryable. Old rows that don't have the new dim yet need to be backfilled.
-
-### Backfill a non-default dim for existing rows
-```bash
-# Backfill every dim (default)
-hermes postgres-memory backfill
-
-# Backfill just one dim
-hermes postgres-memory backfill --dim 768
-hermes postgres-memory backfill --dim 1536
-
-# Dry-run to see what would happen
-hermes postgres-memory backfill --dry-run
-
-# Limit how many rows to process
-hermes postgres-memory backfill --limit 1000
-
-# Adjust batch size for rate-limited APIs
-hermes postgres-memory backfill --batch 8
-```
-
-### Override the model for one dim
-```bash
-# Use mxbai-embed-large on ollama for 1024-dim
-hermes postgres-memory model-set --dim 1024 --provider ollama_local --model mxbai-embed-large
-
-# Use MiniMax for 1536-dim (default — uses the user's MiniMax subscription)
-hermes postgres-memory model-set --dim 1536 --provider minimax --model embo-01
-
-# Use OpenAI for 1536-dim (override)
-hermes postgres-memory model-set --dim 1536 --provider openai --model text-embedding-3-small
-```
-
-Note: providers other than kimi/minimax/ollama_local/ollama_cloud/noop are
-not implemented in `embedder.py` yet. The `minimax` provider (default
-for 1536-dim) is wired up in 1.4.0 and uses MiniMax's
-`https://api.minimax.io/v1/embeddings` endpoint with the
-`embo-01` model. Adding another provider is ~50 lines: see
-the dispatch in `Embedder._embed_live`.
-
----
-
-## Schema layout
-
-```
-agent_memory
-├── id (uuid)
-├── category_id (smallint → memory_categories.id)
-├── target (varchar)              — 'memory' or 'user'
-├── content (text)                — the fact
-├── vector_768   (vector(768))    — nullable, HNSW-indexed
-├── vector_1024  (vector(1024))   — nullable, HNSW-indexed
-├── vector_1536  (vector(1536))   — nullable, HNSW-indexed
-├── content_vector (vector)       — LEGACY (pre-1.2.0). See migration 003.
-├── source_session (uuid)
-├── confidence (smallint, default 80)
-├── is_active (boolean)           — soft delete
-├── created_at, updated_at, expires_at (timestamptz)
-├── tags (text[])
-└── metadata (jsonb)
-
-agent_memory_settings
-├── key (text, PK)                — e.g. 'default_dim'
-└── value (jsonb)                 — e.g. '"1024"' or '768' as JSON number-string
-
-agent_memory_models
-├── dim (smallint, PK)            — 768, 1024, or 1536
-├── provider (text)               — 'kimi', 'minimax', 'ollama_local', 'ollama_cloud', 'noop'
-├── model (text)                  — e.g. 'bge_m3_embed', 'nomic-embed-text', 'embo-01'
-├── base_url (text, nullable)
-└── api_key_env (text, nullable)  — name of the env var holding the API key
-```
-
-A row can have any subset of the three vector columns populated. Switching
-dims does NOT lose data — old vectors stay in their original columns, and
-a `pg_search` always reads the column matching the configured default.
-
----
-
-## Migrations
-
-For users upgrading from 1.0.x / 1.1.0:
-
-```bash
-# 1. As a superuser (postgres role), transfer table ownership to hermes
-PGPASSWORD="..." psql -h 10.49.0.33 -U postgres -d hermes \
-  -f plugins/memory/postgres/migrations/000_grant_ddl_to_hermes.sql
-
-# 2. As the hermes role, add per-dim columns + settings + models
-PGPASSWORD="..." psql -h 10.49.0.33 -U hermes -d hermes \
-  -f plugins/memory/postgres/migrations/001_add_per_dim_columns.sql
-
-# 3. Build per-dim HNSW indexes (CONCURRENTLY — no downtime)
-PGPASSWORD="..." psql -h 10.49.0.33 -U hermes -d hermes \
-  -f plugins/memory/postgres/migrations/002_hnsw_per_dim.sql
-
-# 4. Copy legacy content_vector data into the matching per-dim column
-PGPASSWORD="..." psql -h 10.49.0.33 -U hermes -d hermes \
-  -f plugins/memory/postgres/migrations/003_migrate_legacy_content_vector.sql
-
-# 5. (Later) backfill the other dims
-hermes postgres-memory backfill
-# OR
-python plugins/memory/postgres/scripts/backfill_embeddings.py
-
-# 6. (Later, irreversible) drop the legacy content_vector
-hermes postgres-memory finalize-cutover --yes
-```
-
-The plugin auto-detects the existing column layout on init. If you skip
-step 4, the plugin will still work — but only rows that have a vector
-at the configured default_dim will be searchable.
-
----
-
-## Configuration reference
-
-### Environment variables
-
-| Var | Default | Notes |
-|---|---|---|
-| `PG_MEM_DB_CONN_STR` | (required) | Single libpq DSN. e.g. `postgresql://hermes:***@10.0.0.1:5432/hermes`. The legacy `POSTGRES_*` vars are still accepted but deprecated as of v1.5.0. |
-| `KIMI_API_KEY` | (env) | Free 1024-dim embedder. https://platform.moonshot.cn |
-| `MINIMAX_API_KEY` | (env) | 1536-dim embedder (default for the 1536 column). https://api.minimax.io |
-| `OLLAMA_API_KEY` | (env) | Only needed for ollama_cloud |
-| `HERMES_EMBED_PROVIDER_<dim>` | per-dim default | Override provider for a dim |
-| `HERMES_EMBED_MODEL_<dim>` | per-dim default | Override model for a dim |
-| `HERMES_EMBED_BASE_URL_<dim>` | per-dim default | Override API endpoint |
-| `HERMES_EMBED_API_KEY_<dim>` | (none) | Direct per-dim API key |
-| `HERMES_EMBED_API_KEY` | (none) | Shared API key for all dims |
-| `HERMES_EMBED_DEFAULT_DIM` | `1024` | Fallback default when settings table is empty |
-| `HERMES_EMBED_FAIL_OPEN` | `1` | If 0, embed errors raise EmbeddingError |
-| `HERMES_POSTGRES_HYBRID_TEXT_WEIGHT` | `0.5` | 0..1. Weight of FTS rank vs cosine in hybrid score |
-| `HERMES_POSTGRES_POOL_MIN` | `0` | Min idle connections in the pool |
-| `HERMES_POSTGRES_POOL_MAX` | `2` | Max concurrent connections |
-
-### Per-dim defaults (built-in)
-
-| Dim | Provider | Model | Where to get the key |
-|---|---|---|---|
-| 768 | `ollama_local` | `nomic-embed-text` | `ollama pull nomic-embed-text` |
-| 1024 | `kimi` | `bge_m3_embed` | `KIMI_API_KEY` (https://platform.moonshot.cn, free tier) |
-| 1536 | `minimax` (default) or `openai` | `embo-01` or `text-embedding-3-small` | `MINIMAX_API_KEY` (default) or `OPENAI_API_KEY` |
-
-The 1536 default uses the user's MiniMax subscription (`embo-01` model),
-which is the cheapest path to true 1536-dim vectors. To use OpenAI
-instead, run:
-
-```bash
-hermes postgres-memory model-set --dim 1536 --provider openai --model text-embedding-3-small
-```
-
-(Note: the `openai` provider is not yet implemented in `embedder.py` —
-the plugin currently supports `kimi`, `minimax`, `ollama_local`,
-`ollama_cloud`, and `noop`. Use the MiniMax 1536 default for now.)
-
----
+- `memory_categories`
+- `agent_memory`
+  - `vector_768 vector(768)`
+  - `vector_1024 vector(1024)`
+  - `vector_1536 vector(1536)`
+- `agent_memory_settings`
+- `agent_memory_models`
+- HNSW indexes on all three vector columns
+- full-text, category, target, tag, metadata, and created-at indexes
 
 ## CLI
 
-```
+```bash
+hermes postgres-memory preflight
 hermes postgres-memory status
 hermes postgres-memory model-list
-hermes postgres-memory model-set --dim <768|1024|1536> [--provider X --model Y]
-hermes postgres-memory backfill [--dim N] [--dry-run] [--batch N] [--limit N]
-hermes postgres-memory preflight
-hermes postgres-memory finalize-cutover --yes
-hermes postgres-memory vector-column --set v1|v2       # DEPRECATED, mapped to --dim 1536/1024
+hermes postgres-memory model-set --dim 1024
+hermes postgres-memory backfill --dim 1024
 ```
 
-## Helper scripts
+## Smoke test
 
-The repo ships three first-class installer / uninstaller / preflight
-scripts. They live under `plugins/memory/postgres/scripts/`:
+```bash
+hermes postgres-memory preflight
+hermes postgres-memory status
+```
 
-| Script | What it does |
-|---|---|
-| `bootstrap.sh` | One-shot installer. Asks for the superuser password, creates the database + role + pgvector extension, installs the schema, copies plugin + skill files, patches `.env` and `config.yaml`, runs the preflight. Interactive by default, `--non-interactive` for scripted deploys. |
-| `diagnose.sh` | Preflight checker. Walks 16 prerequisites (hermes-agent checkout, `.env`, psql on PATH, pgvector, role, schema, indexes, etc.) and prints a pass/fail table. Re-runnable. `--json` for automation. |
-| `uninstall.sh` | Inverse of `bootstrap.sh`. Three modes: `--plugin` (files only), `--db` (drop tables), `--all` (both). Plus `--role` and `--database` to drop the role and DB. Asks before each destructive step. |
+Then in a fresh Hermes session:
 
-The database creation SQL that the bootstrap script invokes lives at
-`plugins/memory/postgres/sql/000_create_database_and_role.sql`. It is
-the **only** file in the plugin that requires superuser privileges, and
-it accepts GUCs (`-v dbname=...`, `-v rolename=...`, `-v pw=...`) so
-everything is customizable.
+```text
+pg_remember(content="postgres memory is live", category="fact")
+pg_search(query="postgres memory")
+```
 
----
+## Embedding defaults
 
-## Troubleshooting
+- 768: `ollama_local` / `nomic-embed-text`
+- 1024: `kimi` / `bge_m3_embed` (default)
+- 1536: `minimax` / `embo-01`
 
-### Search returns no results
+Override the default dimension or model through:
 
-Run `hermes postgres-memory status`. Check `per_dim_embedded` — if the dim
-you configured is at zero, you need to either:
-- (a) backfill that dim: `hermes postgres-memory backfill --dim <dim>`
-- (b) switch the default dim: `hermes postgres-memory model-set --dim <dim>`
+```bash
+hermes postgres-memory model-set --dim 768
+hermes postgres-memory model-set --dim 1024 --provider kimi --model bge_m3_embed
+```
 
-### Embedder returns zero vectors
+## Backfill
 
-The embedder fails open to `[0.0] * dim` on provider errors and refuses
-to cache them. Check:
-- For 1024-dim (default): `KIMI_API_KEY` is set in the same env Hermes Agent is running in
-- For 1536-dim (default): `MINIMAX_API_KEY` is set. MiniMax's `embo-01` model returns 1536-dim native, so this is the real 1536-dim path. (`KIMI_API_KEY` will fail to return true 1536-dim vectors — it always returns 1024-dim regardless of model name.)
-- For Ollama: `curl http://localhost:11434/api/tags` returns your pulled model
+Backfill fills missing vectors for existing rows. It is idempotent.
 
-### Old `content_vector` column
+```bash
+python plugins/memory/postgres/scripts/backfill_embeddings.py --dim 1024
+python plugins/memory/postgres/scripts/backfill_embeddings.py
+```
 
-Pre-1.2.0 had a single `content_vector` column. After upgrading, run
-migration `003_migrate_legacy_content_vector.sql` to copy data into the
-matching per-dim column. The legacy column is still readable (the plugin
-auto-detects it) until you run `finalize-cutover`.
+Without `--dim`, all supported dimensions are filled.
 
-### 21/30 tests pass (or some are red)
+## Uninstall
 
-Run `pytest tests/ -v`. The 3 cases most likely to break:
-- `test_add_memory_writes_to_default_dim_column` — depends on
-  `_read_model_config_for_dim` being patchable. If you refactor the
-  embedder factory, ensure tests can still find the plugin's function
-  via sys.modules.
-- `test_search_memories_runs_hybrid_query_with_query_embedding` —
-  the placeholder/param drift guard. If you add a new WHERE clause
-  to `search_memories`, the param list MUST grow correspondingly or
-  this test will catch the mismatch.
+```bash
+plugins/memory/postgres/scripts/uninstall.sh --plugin
+plugins/memory/postgres/scripts/uninstall.sh --db --yes
+plugins/memory/postgres/scripts/uninstall.sh --all --yes
+```
 
----
-
-## License
-
-MIT © Shakib Haris. See [LICENSE](LICENSE).
+The database step drops plugin tables. It does not remove the PostgreSQL role,
+database, or `vector` extension unless explicitly requested.

@@ -8,8 +8,6 @@ agent_memory table with:
 - Pluggable per-dim embedder registry: agent_memory_models table maps
   each dim to a (provider, model, api_key_env) triple. Switch dims
   with `hermes postgres-memory model-set --dim <768|1024|1536>`.
-- Non-destructive migration: three vector columns all nullable, plus
-  a legacy `content_vector` for upgrade compatibility.
 - Hybrid search: FTS pre-filter → cosine re-rank on the default-dim column.
 - Categories, tags, JSONB metadata, TTL, soft deletes.
 - Content-addressable embedding cache (sha256 of dim|provider|model|text).
@@ -17,10 +15,9 @@ agent_memory table with:
   fallback vectors are NOT cached (defense against cache poisoning).
 
 Config via environment variables:
-    PG_MEM_DB_CONN_STR — PostgreSQL libpq DSN (preferred), e.g.
+    PG_MEM_DB_CONN_STR — PostgreSQL DSN, e.g.
                          postgresql://hermes:***@host:5432/hermes
-    POSTGRES_HOST / POSTGRES_PORT / POSTGRES_USER / POSTGRES_PASSWORD /
-    POSTGRES_DATABASE — legacy fallback accepted until v2.0
+                         or Host=host;Port=5432;Database=hermes;Username=hermes;Password=***
     HERMES_EMBED_DEFAULT_DIM — Override default dim if SQL is unavailable
     HERMES_EMBED_PROVIDER_<DIM> / HERMES_EMBED_MODEL_<DIM> /
     HERMES_EMBED_BASE_URL_<DIM> / HERMES_EMBED_API_KEY_<DIM> — per-dim
@@ -105,74 +102,63 @@ def _env_int(name: str, default: int, minimum: int = 1) -> int:
 # ── Connection-string resolver ──────────────────────────────────────────
 #
 # Single source of truth for the postgres memory plugin's DB connection.
-# The preferred env var is PG_MEM_DB_CONN_STR (a single DSN like
-# "postgresql://user:pass@host:port/dbname"). The legacy POSTGRES_*
-# vars are still accepted for backward compatibility — if they're set
-# and PG_MEM_DB_CONN_STR is not, the plugin builds a DSN from them
-# and emits a one-time deprecation warning. The POSTGRES_* support
-# will be removed in v2.0.
-_LEGACY_POSTGRES_VARS = (
-    "POSTGRES_HOST", "POSTGRES_PORT", "POSTGRES_USER",
-    "POSTGRES_PASSWORD", "POSTGRES_DATABASE",
-)
-_DEPRECATION_LOGGED = False
+# Greenfield installs require PG_MEM_DB_CONN_STR: a libpq DSN like
+# "postgresql://user:***@host:port/dbname". If the variable is missing,
+# fail loudly.
 
+def _normalize_pg_mem_dsn(dsn: str) -> str:
+    """Normalize supported PG_MEM_DB_CONN_STR shapes to psycopg2/libpq DSN.
 
-def _build_dsn_from_legacy_vars() -> str:
-    """Construct a postgresql:// DSN from the legacy POSTGRES_* env vars."""
-    host = os.environ.get("POSTGRES_HOST", "localhost")
-    port = os.environ.get("POSTGRES_PORT", "5432")
-    user = os.environ.get("POSTGRES_USER", "hermes")
-    password = os.environ.get("POSTGRES_PASSWORD", "")
-    database = os.environ.get("POSTGRES_DATABASE", "hermes")
-    if not password:
-        raise RuntimeError(
-            "PG_MEM_DB_CONN_STR is not set and POSTGRES_PASSWORD is not set. "
-            "Set PG_MEM_DB_CONN_STR='postgresql://user:pass@host:port/dbname' "
-            "in ~/.hermes/.env."
-        )
-    # urllib.parse.quote so passwords with @, /, : etc. don't break the DSN.
-    from urllib.parse import quote
-    return f"postgresql://{quote(user, safe='')}:{quote(password, safe='')}@{host}:{port}/{database}"
+    Supports normal libpq DSNs plus common semicolon connection strings such as
+    `Host=...;Port=...;Database=...;Username=...;Password=...`.
+    """
+    raw = dsn.strip()
+    if ";" not in raw or "=" not in raw.split(";", 1)[0]:
+        return raw
+
+    mapping = {
+        "host": "host",
+        "server": "host",
+        "port": "port",
+        "database": "dbname",
+        "dbname": "dbname",
+        "user": "user",
+        "username": "user",
+        "userid": "user",
+        "uid": "user",
+        "password": "password",
+        "pwd": "password",
+        "sslmode": "sslmode",
+        "application_name": "application_name",
+        "applicationname": "application_name",
+    }
+    kwargs: Dict[str, str] = {}
+    for part in raw.split(";"):
+        part = part.strip()
+        if not part or "=" not in part:
+            continue
+        key, value = part.split("=", 1)
+        normalized = mapping.get(key.strip().replace(" ", "").lower())
+        if normalized and value.strip():
+            kwargs[normalized] = value.strip()
+    if not kwargs:
+        return raw
+    return make_dsn(**kwargs)
 
 
 def get_pg_mem_db_conn_str() -> str:
-    """Return the postgres memory connection string.
-
-    Resolution order:
-      1. PG_MEM_DB_CONN_STR (preferred) — a postgresql:// DSN
-      2. POSTGRES_HOST/POSTGRES_PORT/POSTGRES_USER/POSTGRES_PASSWORD/POSTGRES_DATABASE
-         (legacy) — built into a DSN at first use, with a one-time
-         deprecation warning. Will be removed in v2.0.
-
-    The returned string is a libpq-style DSN that psycopg2 can
-    consume directly via `psycopg2.connect(dsn)`.
-    """
-    global _DEPRECATION_LOGGED
-    explicit = os.environ.get("PG_MEM_DB_CONN_STR", "").strip()
-    if explicit:
-        return explicit
-    # Legacy fallback
-    if any(os.environ.get(v) for v in _LEGACY_POSTGRES_VARS):
-        if not _DEPRECATION_LOGGED:
-            logger.warning(
-                "POSTGRES_HOST/POSTGRES_PORT/POSTGRES_USER/POSTGRES_PASSWORD/POSTGRES_DATABASE "
-                "are deprecated; set PG_MEM_DB_CONN_STR='postgresql://user:pass@host:port/dbname' "
-                "instead. Legacy support will be removed in v2.0."
-            )
-            _DEPRECATION_LOGGED = True
-        return _build_dsn_from_legacy_vars()
+    """Return the required postgres memory connection string."""
+    dsn = os.environ.get("PG_MEM_DB_CONN_STR", "").strip()
+    if dsn:
+        return _normalize_pg_mem_dsn(dsn)
     raise RuntimeError(
         "No postgres connection configured. Set PG_MEM_DB_CONN_STR in "
         "~/.hermes/.env, e.g. "
-        "PG_MEM_DB_CONN_STR='postgresql://hermes:*** @10.0.0.1:5432/hermes'"
+        "PG_MEM_DB_CONN_STR='postgresql://hermes:***@10.0.0.1:5432/hermes'"
     )
 
-
 def _postgres_dsn() -> str:
-    """Build the full psycopg2 DSN, including timeouts and
-    application_name. Uses get_pg_mem_db_conn_str() for the base
-    connection so legacy POSTGRES_* vars still work."""
+    """Build the full psycopg2 DSN, including timeouts and application_name."""
     base = get_pg_mem_db_conn_str()
     connect_timeout = _env_int("HERMES_POSTGRES_CONNECT_TIMEOUT", 5, minimum=1)
     statement_timeout = _env_int("HERMES_POSTGRES_STATEMENT_TIMEOUT_MS", 10_000, minimum=100)
@@ -221,10 +207,7 @@ def _vector_column_for_dim(dim: int) -> str:
         return "vector_1024"
     if dim == 1536:
         return "vector_1536"
-    raise ValueError(
-        f"Unsupported dim {dim}. Supported: {SUPPORTED_DIMS}. "
-        f"Run a migration to add a vector_<dim> column first."
-    )
+    raise ValueError(f"Unsupported dim {dim}. Supported: {SUPPORTED_DIMS}.")
 
 
 def _read_default_dim(conn) -> int:
@@ -283,10 +266,7 @@ def _read_model_config_for_dim(dim: int) -> dict:
     """
     try:
         import psycopg2 as _psy
-        # Reuse the plugin's connection-string resolver (handles both
-        # PG_MEM_DB_CONN_STR and legacy POSTGRES_* vars). Override the
-        # default 5s connect_timeout here with a short 5s — same as
-        # the legacy version used to — to keep behavior unchanged.
+        # Reuse the plugin's required PG_MEM_DB_CONN_STR resolver.
         dsn = make_dsn(
             dsn=get_pg_mem_db_conn_str(),
             connect_timeout=5,
@@ -479,12 +459,11 @@ class _PostgresClient:
         # ts_rank %s, before the @@ %s), NOT at the start. Building
         # them in the wrong order silently mis-binds target/category
         # to a tsquery slot and returns empty results — a bug
-        # introduced in v1.2.0 and fixed in v1.4.1.
         sql = f"""
             WITH fts_candidates AS (
                 SELECT
                     m.id, m.target, m.content, m.created_at, m.tags, m.metadata,
-                    m.{column} AS content_vector,
+                    m.{column} AS embedding_vector,
                     ts_rank(to_tsvector('english', m.content),
                             plainto_tsquery('english', %s)) AS text_rank
                 FROM agent_memory m
@@ -498,9 +477,9 @@ class _PostgresClient:
             SELECT
                 id, target, content, created_at, tags, metadata,
                 text_rank,
-                (1 - (content_vector <=> %s::vector)) AS vector_sim,
+                (1 - (embedding_vector <=> %s::vector)) AS vector_sim,
                 ({text_weight} * COALESCE(text_rank, 0)
-                 + {vector_weight} * COALESCE((1 - (content_vector <=> %s::vector)), 0)
+                 + {vector_weight} * COALESCE((1 - (embedding_vector <=> %s::vector)), 0)
                 ) AS hybrid_score
             FROM fts_candidates
             ORDER BY hybrid_score DESC
@@ -760,8 +739,7 @@ class PostgresMemoryProvider(MemoryProvider):
             {"key": "conn_str",
              "description": ("PostgreSQL connection string (libpq-style DSN, e.g. "
                             "'postgresql://hermes:***@10.0.0.1:5432/hermes'). "
-                            "The legacy POSTGRES_HOST/PORT/USER/PASSWORD/DATABASE vars "
-                            "are still accepted but deprecated as of v1.5.0."),
+                            "Set PG_MEM_DB_CONN_STR in ~/.hermes/.env."),
              "env_var": "PG_MEM_DB_CONN_STR"},
             {"key": "default_dim", "description": "Default embedding dim (768/1024/1536)",
              "default": "1024", "env_var": "HERMES_EMBED_DEFAULT_DIM"},

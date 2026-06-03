@@ -196,8 +196,7 @@ GRANT ALL ON SCHEMA public TO :rolename;
 \echo '  1. add to ~/.hermes/.env:'
 \echo '       PG_MEM_DB_CONN_STR=postgresql://' :rolename ':<the password you used above>@<host>:' :port '/' :dbname
 \echo '       KIMI_API_KEY=<from https://platform.moonshot.cn>'
-\echo '       (the legacy POSTGRES_HOST/PORT/USER/PASSWORD/DATABASE vars are'
-\echo '        still accepted as of v1.5.0 but deprecated; will be removed in v2.0)'
+\echo '       PG_MEM_DB_CONN_STR is the only supported runtime DB connection setting.'
 \echo '  2. cd to the plugin dir and run:'
 \echo '       psql -h <host> -U ' :rolename ' -d ' :dbname ' -f 000_schema.sql'
 \echo '  3. restart the hermes gateway: hermes gateway restart'

@@ -21,15 +21,15 @@
 #   ./bootstrap.sh --hermes-home /path/to    # override HERMES_HOME
 #
 # Env vars for non-interactive mode:
-#   HERMES_HOME              (default: ~/.hermes/hermes-agent)
-#   POSTGRES_SUPERUSER       (default: postgres)
+#   HERMES_HOME                  (default: ~/.hermes/hermes-agent)
+#   POSTGRES_SUPERUSER           (default: postgres)
 #   POSTGRES_SUPERUSER_PASSWORD  (required in non-interactive)
-#   POSTGRES_HOST            (default: localhost)
-#   POSTGRES_PORT            (default: 5432)
-#   NEW_DB_NAME              (default: hermes)
-#   NEW_ROLE_NAME            (default: hermes)
-#   NEW_ROLE_PASSWORD        (required in non-interactive; refused empty otherwise)
-#   ALLOW_WEAK_PW            (set to 'on' to allow empty password for dev)
+#   PG_SUPER_HOST                (default: localhost)
+#   PG_SUPER_PORT                (default: 5432)
+#   NEW_DB_NAME                  (default: hermes)
+#   NEW_ROLE_NAME                (default: hermes)
+#   NEW_ROLE_PASSWORD            (required in non-interactive; refused empty otherwise)
+#   ALLOW_WEAK_PW                (set to 'on' to allow empty password for dev)
 
 set -uo pipefail
 
@@ -172,9 +172,9 @@ fi
 
 header "2 / 6  ·  database superuser credentials"
 
-# Allow POSTGRES_HOST etc to be set already (from .env or env)
-: "${POSTGRES_HOST:=localhost}"
-: "${POSTGRES_PORT:=5432}"
+# Superuser connection details are bootstrap-only. The plugin runtime uses only PG_MEM_DB_CONN_STR.
+: "${PG_SUPER_HOST:=localhost}"
+: "${PG_SUPER_PORT:=5432}"
 : "${POSTGRES_SUPERUSER:=postgres}"
 
 if [ "$NON_INTERACTIVE" != "1" ]; then
@@ -183,16 +183,16 @@ if [ "$NON_INTERACTIVE" != "1" ]; then
     say
 fi
 
-prompt POSTGRES_HOST     "  superuser host: "     "$POSTGRES_HOST"
-prompt POSTGRES_PORT     "  superuser port: "     "$POSTGRES_PORT"
+prompt PG_SUPER_HOST     "  superuser host: "     "$PG_SUPER_HOST"
+prompt PG_SUPER_PORT     "  superuser port: "     "$PG_SUPER_PORT"
 prompt POSTGRES_SUPERUSER "  superuser role: "     "$POSTGRES_SUPERUSER"
 prompt POSTGRES_SUPERUSER_PASSWORD "  superuser password: " "" "secret"
 
 # Test connection as superuser
 if ! PGPASSWORD="$POSTGRES_SUPERUSER_PASSWORD" psql \
-        -h "$POSTGRES_HOST" -p "$POSTGRES_PORT" -U "$POSTGRES_SUPERUSER" -d postgres \
+        -h "$PG_SUPER_HOST" -p "$PG_SUPER_PORT" -U "$POSTGRES_SUPERUSER" -d postgres \
         -tAc "SELECT 1;" >/dev/null 2>&1; then
-    fail "could not connect to postgres as $POSTGRES_SUPERUSER@$POSTGRES_HOST:$POSTGRES_PORT"
+    fail "could not connect to postgres as $POSTGRES_SUPERUSER@$PG_SUPER_HOST:$PG_SUPER_PORT"
     say "  double-check the host/port/user/password. the role must be a SUPERUSER (or have CREATEROLE + CREATEDB)."
     exit 1
 fi
@@ -200,7 +200,7 @@ ok "connected to postgres as $POSTGRES_SUPERUSER"
 
 # Verify the user really is a superuser
 IS_SUPER=$(PGPASSWORD="$POSTGRES_SUPERUSER_PASSWORD" psql \
-    -h "$POSTGRES_HOST" -p "$POSTGRES_PORT" -U "$POSTGRES_SUPERUSER" -d postgres \
+    -h "$PG_SUPER_HOST" -p "$PG_SUPER_PORT" -U "$POSTGRES_SUPERUSER" -d postgres \
     -tAc "SELECT rolsuper FROM pg_roles WHERE rolname='$POSTGRES_SUPERUSER';" | tr -d ' ')
 if [ "$IS_SUPER" != "t" ]; then
     fail "role $POSTGRES_SUPERUSER is not a SUPERUSER"
@@ -262,8 +262,8 @@ fi
 
 # Build the psql command. Use -v to pass GUCs through to the script.
 PSQL_CMD=(psql
-    -h "$POSTGRES_HOST"
-    -p "$POSTGRES_PORT"
+    -h "$PG_SUPER_HOST"
+    -p "$PG_SUPER_PORT"
     -U "$POSTGRES_SUPERUSER"
     -d postgres
     -v "dbname=$NEW_DB_NAME"
@@ -280,7 +280,7 @@ fi
 
 say "  ${DIM}running:${RESET}"
 printf "    PGPASSWORD=*** psql -h %s -U %s -d postgres -v dbname=%s -v rolename=%s -f %s\n" \
-    "$POSTGRES_HOST" "$POSTGRES_SUPERUSER" "$NEW_DB_NAME" "$NEW_ROLE_NAME" "$CREATE_SQL"
+    "$PG_SUPER_HOST" "$POSTGRES_SUPERUSER" "$NEW_DB_NAME" "$NEW_ROLE_NAME" "$CREATE_SQL"
 echo
 
 if ! PGPASSWORD="$POSTGRES_SUPERUSER_PASSWORD" "${PSQL_CMD[@]}"; then
@@ -292,7 +292,7 @@ ok "database + role + extensions created"
 
 # Verify we can actually connect as the new role
 if ! PGPASSWORD="$NEW_ROLE_PASSWORD" psql \
-        -h "$POSTGRES_HOST" -p "$POSTGRES_PORT" -U "$NEW_ROLE_NAME" -d "$NEW_DB_NAME" \
+        -h "$PG_SUPER_HOST" -p "$PG_SUPER_PORT" -U "$NEW_ROLE_NAME" -d "$NEW_DB_NAME" \
         -tAc "SELECT extname FROM pg_extension WHERE extname='vector';" 2>&1 | grep -q vector; then
     fail "could not verify pgvector as $NEW_ROLE_NAME"
     say "  the extension may not have been installed. check: PGPASSWORD=*** psql -U $NEW_ROLE_NAME -d $NEW_DB_NAME -c '\\dx'"
@@ -305,22 +305,13 @@ ok "$NEW_ROLE_NAME can connect + pgvector is visible"
 header "5 / 6  ·  installing plugin + skill"
 
 # Write a fresh .env block for the plugin (only if not already set).
-# v1.5.0: prefer the single PG_MEM_DB_CONN_STR var (libpq DSN format).
-# The legacy POSTGRES_* form is also written commented-out for users
-# who want to read the individual values.
+ENC_ROLE=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$NEW_ROLE_NAME")
+ENC_PW=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$NEW_ROLE_PASSWORD")
+PG_MEM_BOOTSTRAP_DSN="postgresql://$ENC_ROLE:$ENC_PW@$PG_SUPER_HOST:$PG_SUPER_PORT/$NEW_DB_NAME"
 ENV_BLOCK="
 # ─── postgres memory provider (added by hermes-postgres-memory bootstrap) ───
-# Preferred: a single libpq DSN. Format: postgresql://user:pass@host:port/dbname
-PG_MEM_DB_CONN_STR=postgresql://$NEW_ROLE_NAME:$NEW_ROLE_PASSWORD@$POSTGRES_HOST:$POSTGRES_PORT/$NEW_DB_NAME
-# (Legacy form — still accepted as of v1.5.0 but deprecated, will be
-#  removed in v2.0. Uncomment and use these if you don't want to use
-#  PG_MEM_DB_CONN_STR.)
-# POSTGRES_HOST=$POSTGRES_HOST
-# POSTGRES_PORT=$POSTGRES_PORT
-# POSTGRES_USER=$NEW_ROLE_NAME
-# POSTGRES_PASSWORD=$NEW_ROLE_PASSWORD
-# POSTGRES_DATABASE=$NEW_DB_NAME
-# KIMI_API_KEY=sk-...         # required for the embedder — get one at https://platform.moonshot.cn
+PG_MEM_DB_CONN_STR=$PG_MEM_BOOTSTRAP_DSN
+# KIMI_API_KEY=sk-...         # required for the default 1024-dim embedder
 HERMES_EMBED_DEFAULT_DIM=1024
 HERMES_EMBED_FAIL_OPEN=1
 "
@@ -372,15 +363,11 @@ header "6 / 6  ·  plugin schema + final preflight"
 # Run the plugin's 000_schema.sql (creates agent_memory + settings + models)
 SCHEMA_SQL="$PLUGIN_DIR/sql/000_schema.sql"
 if [ -f "$SCHEMA_SQL" ]; then
-    if PGPASSWORD="$NEW_ROLE_PASSWORD" psql \
-            -h "$POSTGRES_HOST" -p "$POSTGRES_PORT" -U "$NEW_ROLE_NAME" -d "$NEW_DB_NAME" \
-            -f "$SCHEMA_SQL" >/dev/null 2>&1; then
+    if psql "$PG_MEM_BOOTSTRAP_DSN" -f "$SCHEMA_SQL" >/dev/null 2>&1; then
         ok "agent_memory schema installed"
     else
         fail "could not install agent_memory schema"
-        PGPASSWORD="$NEW_ROLE_PASSWORD" psql \
-            -h "$POSTGRES_HOST" -p "$POSTGRES_PORT" -U "$NEW_ROLE_NAME" -d "$NEW_DB_NAME" \
-            -f "$SCHEMA_SQL" 2>&1 | sed 's/^/    /'
+        psql "$PG_MEM_BOOTSTRAP_DSN" -f "$SCHEMA_SQL" 2>&1 | sed 's/^/    /'
         exit 1
     fi
 fi

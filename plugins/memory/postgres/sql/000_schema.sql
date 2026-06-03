@@ -48,11 +48,6 @@ CREATE TABLE IF NOT EXISTS agent_memory (
     vector_768   vector(768),
     vector_1024  vector(1024),
     vector_1536  vector(1536),
-    -- Legacy column from pre-1.2.0 schemas. Nullable. Read by the
-    -- plugin if present and matches the configured dim; otherwise
-    -- ignored. See migrations/002_migrate_legacy_content_vector.sql
-    -- to migrate data out of this column.
-    content_vector vector,
     source_session uuid,
     confidence smallint DEFAULT 80,
     is_active boolean DEFAULT true,
@@ -74,10 +69,6 @@ CREATE INDEX IF NOT EXISTS idx_memory_vector_1024_hnsw
 CREATE INDEX IF NOT EXISTS idx_memory_vector_1536_hnsw
     ON agent_memory USING hnsw (vector_1536 vector_cosine_ops)
     WITH (m = 16, ef_construction = 64);
--- Legacy index, if migrating from pre-1.2.0.
-CREATE INDEX IF NOT EXISTS idx_memory_vector_hnsw
-    ON agent_memory USING hnsw (content_vector vector_cosine_ops)
-    WITH (m = 16, ef_construction = 64);
 
 CREATE INDEX IF NOT EXISTS idx_memory_fts
     ON agent_memory USING gin (to_tsvector('english', content));
@@ -89,8 +80,7 @@ CREATE INDEX IF NOT EXISTS idx_memory_metadata ON agent_memory USING gin (metada
 CREATE INDEX IF NOT EXISTS idx_memory_created ON agent_memory (created_at DESC);
 
 -- Settings table: one row per config key. The plugin reads from
--- here on init. The CLI's `vector-column` and `model-set` commands
--- write to it.
+-- here on init. The CLI's `model-set` command writes to it.
 CREATE TABLE IF NOT EXISTS agent_memory_settings (
     key text PRIMARY KEY,
     value jsonb NOT NULL,

@@ -109,7 +109,7 @@ class Embedder:
         if dim not in SUPPORTED_DIMS:
             raise ValueError(
                 f"Unsupported dim: {dim}. Supported: {SUPPORTED_DIMS}. "
-                f"Add an ALTER TABLE migration before using a new dim."
+                f"Add a vector_<dim> column before using a new dim."
             )
         # Resolve cache_dir from env if not explicitly given. This
         # makes the factory's _read_model_config_for_dim able to

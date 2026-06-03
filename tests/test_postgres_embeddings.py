@@ -62,11 +62,6 @@ def pg_module(monkeypatch, tmp_path_factory):
         if m == "embedder" or m.startswith("plugins.memory.postgres"):
             del sys.modules[m]
     monkeypatch.setenv("PG_MEM_DB_CONN_STR", "postgresql://hermes:***@db:5432/hermes")
-    monkeypatch.delenv("POSTGRES_HOST", raising=False)
-    monkeypatch.delenv("POSTGRES_PORT", raising=False)
-    monkeypatch.delenv("POSTGRES_USER", raising=False)
-    monkeypatch.delenv("POSTGRES_PASSWORD", raising=False)
-    monkeypatch.delenv("POSTGRES_DATABASE", raising=False)
     monkeypatch.setenv("HERMES_EMBED_PROVIDER_768", "ollama_local")
     monkeypatch.setenv("HERMES_EMBED_PROVIDER_1024", "kimi")
     monkeypatch.setenv("HERMES_EMBED_PROVIDER_1536", "kimi")
@@ -320,17 +315,17 @@ def test_hybrid_sql_placeholder_count_matches_params(pg_module, fake_pool, monke
 
 
 def test_hybrid_search_param_ordering_with_target_and_category(pg_module, fake_pool, monkeypatch):
-    """Regression test for the v1.4.1 pg_search param-ordering bug.
+    """Regression test for pg_search param ordering.
 
     The where-clause placeholders (target, category) are *interleaved*
-    in the middle of the SQL, NOT at the start. A pre-v1.4.1 build
+    in the middle of the SQL, NOT at the start. A buggy build
     did `sql_params = list(params) + [query, query, fts_window, ...]`
     which bound the target string to the FIRST %s (the ts_rank
     plainto_tsquery slot), so FTS got the wrong query and the search
     returned 0 rows.
 
     This test asserts that the right values are bound to the right
-    slots. With the v1.4.1 fix, params[0] is the query (for ts_rank),
+    slots. With the fix, params[0] is the query (for ts_rank),
     params[1] is the target string (for WHERE target = %s), and
     params[2] is the category_id (for WHERE category_id = %s).
     """
@@ -383,10 +378,7 @@ def test_hybrid_search_param_ordering_with_target_and_category(pg_module, fake_p
 
 def test_hybrid_search_param_ordering_without_target(pg_module, fake_pool, monkeypatch):
     """Same regression guard, but without target/category — the
-    degenerate case where `params` is empty. The v1.4.1 fix must
-    still produce a correct param order (and the v1.2.0 code
-    happened to be correct in this case, which is why the bug
-    was masked for so long)."""
+    degenerate case where `params` is empty. The fixed implementation must still produce a correct param order when there are no where-clause params."""
     client = pg_module._PostgresClient()
     monkeypatch.setattr(pg_module, "_read_default_dim", lambda c: 1024)
 
@@ -503,3 +495,28 @@ def test_read_default_dim_falls_back_to_env(monkeypatch):
     pg = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(pg)
     assert pg._read_default_dim(Conn()) == 1536
+
+def test_pg_mem_db_conn_str_is_required(pg_module, monkeypatch):
+    """The runtime database connection is DSN-only."""
+    monkeypatch.delenv("PG_MEM_DB_CONN_STR", raising=False)
+    with pytest.raises(RuntimeError, match="PG_MEM_DB_CONN_STR"):
+        pg_module.get_pg_mem_db_conn_str()
+
+
+def test_pg_mem_db_conn_str_returns_dsn(pg_module, monkeypatch):
+    dsn = "postgresql://hermes:***@db:5432/hermes"
+    monkeypatch.setenv("PG_MEM_DB_CONN_STR", dsn)
+    assert pg_module.get_pg_mem_db_conn_str() == dsn
+
+
+def test_pg_mem_db_conn_str_normalizes_semicolon_connection_string(pg_module, monkeypatch):
+    monkeypatch.setenv(
+        "PG_MEM_DB_CONN_STR",
+        "Host=10.49.0.33;Port=5432;Database=hermes;Username=hermes;Password=secret",
+    )
+    dsn = pg_module.get_pg_mem_db_conn_str()
+    assert "host=10.49.0.33" in dsn
+    assert "port=5432" in dsn
+    assert "dbname=hermes" in dsn
+    assert "user=hermes" in dsn
+    assert "password=secret" in dsn

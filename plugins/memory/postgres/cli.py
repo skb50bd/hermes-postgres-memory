@@ -10,9 +10,7 @@ Subcommands
 - model-list            — List per-dim model configs
 - model-set             — Switch the default dim and/or model
 - backfill              — Run the backfill script (per-dim, parallel)
-- preflight             — Pre-migration checks (ownership, schema, dims)
-- finalize-cutover      — Drop the legacy content_vector column (irreversible)
-- vector-column         — Legacy: show/set the live vector column (deprecated)
+- preflight             — Schema/readiness checks (ownership, schema, dims)
 """
 
 from __future__ import annotations
@@ -28,10 +26,7 @@ import psycopg2
 
 
 def _conn():
-    """Build a psycopg2 connection from PG_MEM_DB_CONN_STR (preferred)
-    or the legacy POSTGRES_* vars. The plugin's get_pg_mem_db_conn_str
-    helper handles both forms and emits a one-time deprecation warning
-    on legacy use. Will be removed in v2.0."""
+    """Build a psycopg2 connection from required PG_MEM_DB_CONN_STR."""
     from psycopg2.extensions import make_dsn
     from plugins.memory.postgres import get_pg_mem_db_conn_str
     return psycopg2.connect(
@@ -50,17 +45,6 @@ def _table_exists(cur, table: str) -> bool:
     )
     return cur.fetchone()[0]
 
-
-def _column_dim(cur, table: str, column: str) -> Optional[int]:
-    cur.execute(
-        "SELECT atttypmod FROM pg_attribute "
-        "WHERE attrelid = %s::regclass AND attname = %s",
-        (table, column),
-    )
-    row = cur.fetchone()
-    if not row or row[0] is None or row[0] < 0:
-        return None
-    return row[0]
 
 
 # ── Subcommand handlers ──────────────────────────────────────────────────
@@ -243,67 +227,8 @@ def cmd_backfill(args, parser) -> int:
     return subprocess.call(cmd)
 
 
-def cmd_finalize_cutover(args, parser) -> int:
-    """Drop the legacy content_vector column. IRREVERSIBLE. Requires --yes."""
-    if not args.yes:
-        print("This will DROP content_vector (legacy dim) from agent_memory.", file=sys.stderr)
-        print("This is IRREVERSIBLE. Re-run with --yes to confirm.", file=sys.stderr)
-        return 2
-    conn = _conn()
-    try:
-        with conn.cursor() as cur:
-            if not _table_exists(cur, "agent_memory"):
-                print("agent_memory table does not exist.", file=sys.stderr)
-                return 2
-            # Confirm at least one per-dim column has data
-            for d in (768, 1024, 1536):
-                col = f"vector_{d}"
-                if not _table_exists(cur, col) and False:  # always false; we check column not table
-                    pass
-                cur.execute(
-                    f"SELECT COUNT(*) FROM information_schema.columns "
-                    f"WHERE table_name = 'agent_memory' AND column_name = %s",
-                    (col,),
-                )
-                if cur.fetchone()[0]:
-                    cur.execute(
-                        f"SELECT COUNT(*) FROM agent_memory "
-                        f"WHERE is_active = TRUE AND {col} IS NOT NULL "
-                        f"AND {col} <> array_fill(0, ARRAY[%s])::vector",
-                        (d,),
-                    )
-                    non_zero = cur.fetchone()[0]
-                    if non_zero > 0:
-                        cur.execute("SELECT COUNT(*) FROM agent_memory WHERE is_active = TRUE")
-                        total = cur.fetchone()[0]
-                        if total > 0 and non_zero / total < 0.5:
-                            print(
-                                f"Refusing: only {non_zero}/{total} rows have non-zero {col}.",
-                                file=sys.stderr,
-                            )
-                            print(
-                                f"Run `hermes postgres-memory backfill --dim {d}` first.",
-                                file=sys.stderr,
-                            )
-                            return 3
-                        break  # found a populated per-dim column
-            else:
-                print("No populated per-dim column found; refusing to drop legacy data.",
-                      file=sys.stderr)
-                return 3
-            print("Dropping idx_memory_vector_hnsw (legacy)...")
-            cur.execute("DROP INDEX IF EXISTS idx_memory_vector_hnsw")
-            print("Dropping content_vector...")
-            cur.execute("ALTER TABLE agent_memory DROP COLUMN IF EXISTS content_vector")
-        conn.commit()
-        print("Cutover complete. Only the per-dim vector columns remain.")
-        return 0
-    finally:
-        conn.close()
-
-
 def cmd_preflight(args, parser) -> int:
-    """Run pre-migration checks."""
+    """Run schema/readiness checks."""
     from plugins.memory.postgres import SUPPORTED_DIMS
     conn = _conn()
     errors: List[str] = []
@@ -322,7 +247,7 @@ def cmd_preflight(args, parser) -> int:
             if owner != me:
                 errors.append(
                     f"agent_memory is owned by {owner!r}, not {me!r}. "
-                    f"Run migrations/000_grant_ddl_to_hermes.sql as a superuser."
+                    f"Grant/transfer ownership to the configured PG_MEM_DB_CONN_STR role."
                 )
             # Per-dim columns
             dims_present: dict = {}
@@ -334,8 +259,6 @@ def cmd_preflight(args, parser) -> int:
                     (col,),
                 )
                 dims_present[d] = cur.fetchone() is not None
-            # Legacy column
-            legacy_dim = _column_dim(cur, "agent_memory", "content_vector")
             # Settings + models tables
             has_settings = _table_exists(cur, "agent_memory_settings")
             has_models = _table_exists(cur, "agent_memory_models")
@@ -372,7 +295,6 @@ def cmd_preflight(args, parser) -> int:
             "default_dim": default_dim,
             "dims_present": dims_present,
             "per_dim_embedded": per_dim_counts,
-            "legacy_content_vector_dim": legacy_dim,
             "settings_table": has_settings,
             "models_table": has_models,
             "errors": errors,
@@ -381,38 +303,6 @@ def cmd_preflight(args, parser) -> int:
     finally:
         conn.close()
 
-
-def cmd_vector_column(args, parser) -> int:
-    """DEPRECATED in 1.2.0. Kept for backward compat — proxies to model-set."""
-    if args.set:
-        # Map v1/v2 to dim values
-        if args.set == "v1":
-            # Old v1 was 1536-dim. Map accordingly.
-            print("DEPRECATED: --set v1 mapped to --dim 1536 (legacy 1536-dim).",
-                  file=sys.stderr)
-            args.dim = 1536
-        elif args.set == "v2":
-            # Old v2 was 1024-dim.
-            print("DEPRECATED: --set v2 mapped to --dim 1024 (Kimi BGE-M3).",
-                  file=sys.stderr)
-            args.dim = 1024
-        cmd_model_set(args, parser)
-        return 0
-    # Show mode
-    conn = _conn()
-    try:
-        with conn.cursor() as cur:
-            if not _table_exists(cur, "agent_memory_settings"):
-                print("(no settings table)", file=sys.stderr)
-                return 0
-            cur.execute(
-                "SELECT value FROM agent_memory_settings WHERE key = 'default_dim'"
-            )
-            row = cur.fetchone()
-            print(f"default_dim: {row[0] if row else '(unset)'}")
-        return 0
-    finally:
-        conn.close()
 
 
 # ── Argparse wiring ──────────────────────────────────────────────────────
@@ -450,24 +340,7 @@ def register_cli(subparser) -> None:
                       help="Backfill a specific dim only (default: all dims).")
     s_bf.set_defaults(func=cmd_backfill)
 
-    s_pre = subs.add_parser("preflight", help="Pre-migration checks")
+    s_pre = subs.add_parser("preflight", help="Schema/readiness checks")
     s_pre.set_defaults(func=cmd_preflight)
-
-    s_cut = subs.add_parser(
-        "finalize-cutover",
-        help="Drop the legacy content_vector column. IRREVERSIBLE. Requires --yes.",
-    )
-    s_cut.add_argument("--yes", action="store_true", required=True,
-                       help="Confirm you understand this is irreversible.")
-    s_cut.set_defaults(func=cmd_finalize_cutover)
-
-    # Deprecated: kept for backward compat with 1.1.0-era scripts.
-    s_vc = subs.add_parser(
-        "vector-column",
-        help="DEPRECATED in 1.2.0. Use `model-set` instead.",
-    )
-    s_vc.add_argument("--set", choices=["v1", "v2"],
-                      help="Mapped to --dim 1536 (v1) or --dim 1024 (v2)")
-    s_vc.set_defaults(func=cmd_vector_column)
 
     p.set_defaults(func=lambda args, parser: p.print_help() or 1)

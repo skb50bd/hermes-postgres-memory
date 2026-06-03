@@ -409,6 +409,13 @@ class _PostgresClient:
         vector_weight = 1.0 - text_weight
         fts_window = max(top_k * _FTS_WINDOW_OVERFETCH, _FTS_WINDOW_MIN)
 
+        # Build the param list in the exact order the %s placeholders
+        # appear in the rendered SQL. The where-clause slots are
+        # *interleaved* in the middle of the SQL (after the first
+        # ts_rank %s, before the @@ %s), NOT at the start. Building
+        # them in the wrong order silently mis-binds target/category
+        # to a tsquery slot and returns empty results — a bug
+        # introduced in v1.2.0 and fixed in v1.4.1.
         sql = f"""
             WITH fts_candidates AS (
                 SELECT
@@ -435,8 +442,10 @@ class _PostgresClient:
             ORDER BY hybrid_score DESC
             LIMIT %s
         """
-        sql_params = list(params) + [query, query, fts_window,
-                                     query_embedding, query_embedding, top_k]
+        # Order: [query_for_ts_rank, *where_params, query_for_fts_match,
+        #         fts_window, query_embedding, query_embedding, top_k]
+        sql_params = [query] + list(params) + [query, fts_window,
+                                              query_embedding, query_embedding, top_k]
 
         with self._cursor() as cur:
             cur.execute(sql, sql_params)

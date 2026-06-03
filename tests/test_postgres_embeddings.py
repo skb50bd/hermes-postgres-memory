@@ -318,6 +318,98 @@ def test_hybrid_sql_placeholder_count_matches_params(pg_module, fake_pool, monke
         )
 
 
+def test_hybrid_search_param_ordering_with_target_and_category(pg_module, fake_pool, monkeypatch):
+    """Regression test for the v1.4.1 pg_search param-ordering bug.
+
+    The where-clause placeholders (target, category) are *interleaved*
+    in the middle of the SQL, NOT at the start. A pre-v1.4.1 build
+    did `sql_params = list(params) + [query, query, fts_window, ...]`
+    which bound the target string to the FIRST %s (the ts_rank
+    plainto_tsquery slot), so FTS got the wrong query and the search
+    returned 0 rows.
+
+    This test asserts that the right values are bound to the right
+    slots. With the v1.4.1 fix, params[0] is the query (for ts_rank),
+    params[1] is the target string (for WHERE target = %s), and
+    params[2] is the category_id (for WHERE category_id = %s).
+    """
+    client = pg_module._PostgresClient()
+    monkeypatch.setattr(pg_module, "_read_default_dim", lambda c: 1024)
+
+    def fake_live(self, text):
+        return [0.5] * EMBED_DIM_1024
+
+    monkeypatch.setattr(pg_module.get_embedder(1024).__class__, "_embed_live", fake_live)
+    client.search_memories("hybrid search query", target="memory",
+                            category="fact", top_k=5)
+
+    cur = fake_pool.conn.cursors[-1]
+    # Find the fts_candidates execution (the hybrid search SQL)
+    fts_exec = next(
+        (e for e in cur.executions if "fts_candidates" in e[0]),
+        None,
+    )
+    assert fts_exec is not None, f"no fts_candidates SQL found in {cur.executions}"
+    sql, params = fts_exec
+
+    # The param order is: [query_for_ts_rank, *where_params, query_for_fts_match,
+    #                     fts_window, query_embedding, query_embedding, top_k]
+    # With target="memory" and category="fact" (category_id will be 1 per the fake
+    # cursor's "SELECT id FROM memory_categories" stub), we expect:
+    assert params[0] == "hybrid search query", (
+        f"param[0] (ts_rank query) should be the user's query, got: {params[0]!r}"
+    )
+    assert params[1] == "memory", (
+        f"param[1] (WHERE target = %s) should be the target string, got: {params[1]!r}"
+    )
+    assert params[2] == 1, (
+        f"param[2] (WHERE category_id = %s) should be the category_id from the lookup, "
+        f"got: {params[2]!r}"
+    )
+    assert params[3] == "hybrid search query", (
+        f"param[3] (@@ tsquery) should be the user's query, got: {params[3]!r}"
+    )
+    # The fts_window comes next: max(top_k * 4, 40) = max(5*4, 40) = 40
+    assert params[4] == max(5 * 4, 40), (
+        f"param[4] (fts_window LIMIT) should be 40, got: {params[4]!r}"
+    )
+    # Then the query embedding appears twice
+    assert params[5] == [0.5] * EMBED_DIM_1024
+    assert params[6] == [0.5] * EMBED_DIM_1024
+    # And the outer LIMIT top_k
+    assert params[7] == 5, f"param[7] (outer LIMIT) should be top_k=5, got: {params[7]!r}"
+
+
+def test_hybrid_search_param_ordering_without_target(pg_module, fake_pool, monkeypatch):
+    """Same regression guard, but without target/category — the
+    degenerate case where `params` is empty. The v1.4.1 fix must
+    still produce a correct param order (and the v1.2.0 code
+    happened to be correct in this case, which is why the bug
+    was masked for so long)."""
+    client = pg_module._PostgresClient()
+    monkeypatch.setattr(pg_module, "_read_default_dim", lambda c: 1024)
+
+    def fake_live(self, text):
+        return [0.5] * EMBED_DIM_1024
+
+    monkeypatch.setattr(pg_module.get_embedder(1024).__class__, "_embed_live", fake_live)
+    client.search_memories("no-filter query", top_k=3)
+
+    cur = fake_pool.conn.cursors[-1]
+    fts_exec = next((e for e in cur.executions if "fts_candidates" in e[0]), None)
+    assert fts_exec is not None
+    sql, params = fts_exec
+
+    # No target/category → params[0] is the query, params[1] is the query,
+    # then fts_window, then 2x embedding, then top_k.
+    assert params[0] == "no-filter query"
+    assert params[1] == "no-filter query"
+    assert params[2] == max(3 * 4, 40)
+    assert params[3] == [0.5] * EMBED_DIM_1024
+    assert params[4] == [0.5] * EMBED_DIM_1024
+    assert params[5] == 3
+
+
 def test_search_supports_per_dim_override(pg_module, fake_pool, monkeypatch):
     """`pg_search dim=768` queries the 768-dim column even when default is 1024."""
     client = pg_module._PostgresClient()

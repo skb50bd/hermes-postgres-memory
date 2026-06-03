@@ -1,5 +1,57 @@
 # Changelog
 
+## 1.4.1 (2026-06-03)
+
+### Fixed
+- **`pg_search` param ordering bug** (introduced in v1.2.0, found via
+  the v1.4.0 live smoke test). When `target` or `category` was
+  passed to `search_memories`, the param list was prepended with
+  the where-clause values:
+  ```python
+  sql_params = list(params) + [query, query, fts_window, ...]
+  ```
+  But the SQL has the `WHERE` block in the *middle* (after the first
+  `ts_rank(..., plainto_tsquery('english', %s))` slot, before the
+  `@@` slot), not at the start. So the `target='memory'` value
+  ended up bound to the FTS `ts_rank` query, the FTS got the
+  literal word `"memory"` instead of the user's query, and the
+  search returned zero results.
+
+  Symptom: `pg_search(query="...", target="memory")` returns
+  `{"results": [], "message": "No matching memories found."}`
+  even when memories obviously exist that match. The bug was
+  invisible without `target` set — the default `pg_search`
+  (no target) still worked, masking the regression for months.
+
+  **Fix**: build `sql_params` in the exact order the `%s`
+  placeholders appear in the rendered SQL:
+  ```python
+  sql_params = [query] + list(params) + [query, fts_window,
+                                        query_embedding, query_embedding, top_k]
+  ```
+
+### Tests
+- 2 new regression tests:
+  - `test_hybrid_search_param_ordering_with_target_and_category` —
+    asserts the right value is bound to each `%s` slot
+    (query → ts_rank, target → WHERE, category_id → WHERE, query → @@,
+    fts_window → LIMIT, embedding, embedding, top_k → LIMIT)
+  - `test_hybrid_search_param_ordering_without_target` — same
+    guard for the no-filter case
+- Both tests **fail on the buggy v1.4.0 code** (verified by stash +
+  re-run: caught exactly the mis-binding) and **pass on v1.4.1**
+- **39/39 pass** (was 37)
+
+### Live verification
+- Wrote a unique test row via `pg_remember` (1024-dim via kimi).
+- Direct DB inspection: vector is 1024-dim, non-zero, content
+  matches.
+- `pg_search(query="quick brown fox smoketest", target="memory")`
+  before fix: 0 results.
+- `pg_search(...)` after fix: 1 result, the test row, with
+  `vector_sim=0.777`, `text_rank=0.600`, `rank=0.689`.
+- Test row soft-deleted; live DB clean.
+
 ## 1.4.0 (2026-06-03)
 
 ### Major changes

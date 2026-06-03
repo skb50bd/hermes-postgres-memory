@@ -2,8 +2,10 @@
 
 This reference explains what the database needs, why each requirement
 exists, and the exact SQL the `000_create_database_and_role.sql` script
-runs. Read this if you need to bootstrap the database by hand, or if
-the bootstrap script is failing and you want to understand why.
+runs. Read this if a DB admin needs to bootstrap the database by hand, or if
+the agent-side bootstrap says prerequisites are missing. The agent/runtime
+should not have PostgreSQL superuser access; privileged operations happen
+outside the agent session and are verified afterward.
 
 ## What the plugin needs from the database
 
@@ -15,6 +17,12 @@ the bootstrap script is failing and you want to understand why.
 | The role owns the `public` schema | `CREATE TABLE` / `CREATE INDEX` are owner-gated, not grant-gated | Same file |
 | A connection limit (default: 20) | Prevents a buggy plugin from saturating the server's connection slots | Same file |
 | The role is **not** a superuser | Defense in depth. The plugin never needs DDL on system tables. | (Not enforced by the script — just convention) |
+
+## Agent-vs-admin boundary
+
+- Admin-side: create role/database, install `vector`, transfer `public` schema ownership, set connection limits.
+- Agent-side: verify those prerequisites, install plugin files, run `000_schema.sql` through `PG_MEM_DB_CONN_STR`, run preflight/smoke tests.
+- If admin-side checks fail, stop and return this SQL/reference to the user. Do not ask the agent for superuser credentials.
 
 ## What the SQL does, step by step
 
@@ -75,8 +83,8 @@ What the script does, in order:
 ## The password-piping caveat
 
 `psql` reads the password from `PGPASSWORD` env var or from
-`~/.pgpass`. The bootstrap script uses `PGPASSWORD`. If you copy-paste
-this:
+`~/.pgpass`. The admin-side examples below use `PGPASSWORD`. If a DB admin
+copy-pastes this:
 
 ```bash
 PGPASSWORD=*** psql -h <host> -U postgres ...
@@ -123,9 +131,9 @@ PGPASSFILE="$TMP" psql -h <host> -U postgres -c '\du'
 rm -f "$TMP"
 ```
 
-The bootstrap script uses Pattern A (env var + `set -a` to load from
-`.env` if present) but you'll need to be careful with quoting if your
-password contains special characters.
+For admin-side one-off SQL runs, Pattern A is quick but quoting-sensitive.
+Use `~/.pgpass` or another password manager when the password contains shell
+special characters.
 
 ## Why no GRANT statements?
 

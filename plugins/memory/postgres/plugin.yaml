@@ -1,5 +1,5 @@
 name: postgres
-version: 1.5.1
+version: 1.6.1
 description: "PostgreSQL + pgvector memory — HNSW semantic search, full-text search, hybrid retrieval, categories, tags, TTL, soft deletes, and pluggable embedders."
 author: "Shakib Haris"
 license: "MIT"

@@ -1,14 +1,14 @@
 -- 000_create_database_and_role.sql
 --
--- ONE-TIME bootstrap for the postgres memory provider.
+-- ONE-TIME ADMIN-SIDE prerequisite bootstrap for the postgres memory provider.
 --
--- Creates the database, the application role, and the pgvector extension.
+-- Creates the database, the non-superuser application role, and the pgvector extension.
 -- This file MUST be run as a PostgreSQL superuser (typically the `postgres`
 -- role), ONCE per server.
 --
 -- Defaults (all overridable via psql \setvars before \i or by editing):
 --   database name  : hermes
---   role name      : hermes
+--   role name      : hermes (dedicated non-superuser runtime role)
 --   role password  : (randomly generated, 24 chars, must be set in psql)
 --   connection limit for the role: 20
 --
@@ -197,8 +197,9 @@ GRANT ALL ON SCHEMA public TO :rolename;
 \echo '       PG_MEM_DB_CONN_STR=postgresql://' :rolename ':<the password you used above>@<host>:' :port '/' :dbname
 \echo '       KIMI_API_KEY=<from https://platform.moonshot.cn>'
 \echo '       PG_MEM_DB_CONN_STR is the only supported runtime DB connection setting.'
-\echo '  2. cd to the plugin dir and run:'
-\echo '       psql -h <host> -U ' :rolename ' -d ' :dbname ' -f 000_schema.sql'
+\echo '  2. give the runtime DSN to the agent and run the agent-side bootstrap:'
+\echo '       ./plugins/memory/postgres/scripts/bootstrap.sh'
+\echo '     bootstrap verifies prerequisites and runs 000_schema.sql as the runtime role.'
 \echo '  3. restart the hermes gateway: hermes gateway restart'
 \echo '  4. verify: hermes postgres-memory preflight && hermes postgres-memory status'
 \echo '════════════════════════════════════════════════════════════════'

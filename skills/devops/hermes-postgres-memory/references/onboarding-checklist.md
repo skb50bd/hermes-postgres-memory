@@ -6,8 +6,9 @@ Greenfield-only checklist for installing the Hermes Postgres memory provider.
 
 - PostgreSQL 13+ reachable
 - `psql` and `pg_isready` available
-- `vector` extension installable in the target database
-- Dedicated application role/database, usually `hermes` / `hermes`
+- DBA has installed `vector` extension in the target database
+- Dedicated non-superuser application role/database, usually `hermes` / `hermes`
+- Runtime role owns `public` schema and can create/drop plugin objects
 - `~/.hermes/.env` contains `PG_MEM_DB_CONN_STR`
 - An embedder key is available, usually `KIMI_API_KEY`
 - Hermes config can set `memory.provider: postgres`
@@ -25,7 +26,8 @@ psql "$PG_MEM_DB_CONN_STR" -tAc "SELECT extversion FROM pg_extension WHERE extna
 
 ```bash
 ./plugins/memory/postgres/scripts/bootstrap.sh
-# or, if DB already exists:
+# bootstrap verifies DBA prerequisites; it does not use superuser access
+# or, if DB already exists and is already verified:
 ./install.sh
 psql "$PG_MEM_DB_CONN_STR" -f plugins/memory/postgres/sql/000_schema.sql
 ```
@@ -49,6 +51,6 @@ pg_search(query="postgres plugin")
 
 - Missing `PG_MEM_DB_CONN_STR`: edit `~/.hermes/.env` and restart Hermes.
 - `pg_isready` fails: host/port/firewall/role credential issue in the DSN.
-- `pgvector` missing: run `sql/000_create_database_and_role.sql` as DB admin.
-- Schema tables missing: run `sql/000_schema.sql` using `PG_MEM_DB_CONN_STR`.
+- `pgvector` missing: ask the DB admin to run `sql/000_create_database_and_role.sql` or otherwise `CREATE EXTENSION vector`; do not use agent superuser access.
+- Schema tables missing: run `sql/000_schema.sql` using `PG_MEM_DB_CONN_STR`; permission errors mean DBA prerequisites are incomplete.
 - Search empty: confirm `vector_<dim>` rows exist and query has FTS token overlap.

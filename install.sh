@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # install.sh — install the postgres memory plugin into a Hermes Agent checkout.
 #
-# This is a thin wrapper around the per-file copy. The real work — database
-# creation, extension install, .env patching, config.yaml editing, plugin
-# activation — is done by `bootstrap.sh` (interactive) or by hand. Use
-# `install.sh` when you already have a working database and just want the
-# files dropped in.
+# This is a thin wrapper around the per-file copy. Database role/database
+# creation, pgvector install, and privileged grants are DBA prerequisites.
+# bootstrap.sh verifies those prerequisites, writes local config, installs
+# schema through PG_MEM_DB_CONN_STR, and then preflights the plugin. Use
+# install.sh when prerequisites are already met and you just want files copied.
 #
 # Usage:
 #   ./install.sh                                # install into ~/.hermes/hermes-agent
@@ -128,11 +128,14 @@ Next steps:
        PG_MEM_DB_CONN_STR='postgresql://hermes:***@10.0.0.1:5432/hermes'
        KIMI_API_KEY=***   # https://platform.moonshot.cn
 
-  2. Make sure the database is set up. If you haven't done that yet,
-     run the one-shot installer from the repo root:
+  2. Make sure DBA prerequisites are complete before runtime use:
+       - dedicated non-superuser role/database
+       - pgvector installed in the target database
+       - runtime role owns public schema and can create objects
+     Then run the agent-side bootstrap/preflight:
        ./plugins/memory/postgres/scripts/bootstrap.sh
-     (it creates the database, the role, the pgvector extension, and
-     installs the agent_memory schema.)
+     (it verifies prerequisites and installs agent_memory schema; it does
+     not use PostgreSQL superuser credentials.)
 
   3. Edit ~/.hermes/config.yaml:
        memory:
@@ -146,8 +149,8 @@ Next steps:
        hermes postgres-memory preflight
        hermes postgres-memory status
 
-For first-time installs, the bootstrap script is the recommended path.
-This install.sh is for when you already have a working database and
-just want the files dropped in.
+For first-time agent-side installs, bootstrap.sh is the recommended path after
+DBA prerequisites are complete. This install.sh is for when you already have a
+working database and just want the files dropped in.
 
 EOF

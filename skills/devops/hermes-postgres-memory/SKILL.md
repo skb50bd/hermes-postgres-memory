@@ -1,7 +1,7 @@
 ---
 name: hermes-postgres-memory
 description: "Install, configure, troubleshoot, and harden the greenfield PostgreSQL/pgvector memory provider for Hermes Agent."
-version: 1.6.0
+version: 1.6.1
 author: Shakib Haris
 license: MIT
 platforms: [linux, macos, windows]
@@ -41,20 +41,26 @@ If the user asks about Hermes Agent CLI/config/gateway itself, also load
 
 ## Greenfield install
 
+The agent/runtime should not have PostgreSQL superuser access. Treat role/database
+creation, `CREATE EXTENSION vector`, and schema ownership grants as DBA
+prerequisites. The agent verifies them before installing or using the plugin.
+
 ```bash
 git clone https://github.com/skb50bd/hermes-postgres-memory.git /tmp/hpm
 cd /tmp/hpm
-./plugins/memory/postgres/scripts/bootstrap.sh
+PG_MEM_DB_CONN_STR='postgresql://hermes:***@host:5432/hermes' \
+  ./plugins/memory/postgres/scripts/bootstrap.sh
 ```
 
 The bootstrap script:
 
 1. Checks `psql`, Python, psycopg2, and the Hermes checkout.
-2. Creates the role/database/pgvector extension when given superuser access.
-3. Writes a single `PG_MEM_DB_CONN_STR` entry to `~/.hermes/.env`.
-4. Creates the greenfield schema via `sql/000_schema.sql`.
+2. Reads `PG_MEM_DB_CONN_STR` for the dedicated non-superuser runtime role.
+3. Verifies DBA prerequisites: runtime role is not superuser, pgvector exists, public schema is owned by the runtime role, and object creation works.
+4. Writes a single `PG_MEM_DB_CONN_STR` entry to `~/.hermes/.env` if missing.
 5. Installs the plugin and this skill into the Hermes checkout.
-6. Runs `diagnose.sh`.
+6. Creates the greenfield schema via `sql/000_schema.sql` using the runtime role.
+7. Runs `diagnose.sh`.
 
 After bootstrap, the user must add an embedder key and restart Hermes:
 
@@ -65,7 +71,7 @@ hermes gateway restart
 
 ## Existing database install
 
-If `~/.hermes/.env` already has the DSN and the database already has pgvector:
+If `~/.hermes/.env` already has the DSN and DBA prerequisites are complete:
 
 ```bash
 cd ~/repos/hermes-postgres-memory
@@ -161,6 +167,7 @@ Without `--dim`, it attempts all supported dimensions.
    psql "$PG_MEM_DB_CONN_STR" -tAc "SELECT 1 FROM pg_extension WHERE extname='vector';"
    ```
 4. Run `hermes postgres-memory preflight`.
+5. If pgvector, schema ownership, or object creation fails, stop and hand the user/admin `sql/000_create_database_and_role.sql`; do not request or use PostgreSQL superuser credentials from the agent.
 
 ### Search returns nothing
 
@@ -223,3 +230,4 @@ explicit `--role` / `--database` flags.
   Mixing models inside a column silently ruins similarity scores.
 - Do not claim embeddings work from schema alone. Verify non-null/non-zero
   vectors and run a real `pg_search` smoke test.
+- Never assume the agent has PostgreSQL superuser access. Privileged DB work is prerequisite/admin-owned; agent-side automation verifies and fails loud.

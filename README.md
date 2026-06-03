@@ -26,16 +26,33 @@ KIMI_API_KEY='***'
 It may be a normal URI DSN or a semicolon connection string such as
 `Host=...;Port=5432;Database=hermes;Username=hermes;Password=...`.
 
+## Database prerequisite contract
+
+The Hermes agent/runtime is not expected to have PostgreSQL superuser access.
+Privileged DB setup is a prerequisite, not an agent operation. Before the plugin
+is installed or used, a DB admin must provide:
+
+- a dedicated non-superuser runtime role/database
+- `pgvector` installed in that database
+- `public` schema owned by the runtime role, with object creation rights
+- a final `PG_MEM_DB_CONN_STR` for that runtime role
+
+Use `plugins/memory/postgres/sql/000_create_database_and_role.sql` as the
+admin-side reference script. Run it outside the agent session with DBA access.
+The agent-side bootstrap only verifies these prerequisites and stops loudly if
+they are not met.
+
 ## Install
 
 ```bash
 git clone https://github.com/skb50bd/hermes-postgres-memory.git /tmp/hpm
 cd /tmp/hpm
-./plugins/memory/postgres/scripts/bootstrap.sh
+PG_MEM_DB_CONN_STR='postgresql://hermes:***@10.0.0.1:5432/hermes' \
+  ./plugins/memory/postgres/scripts/bootstrap.sh
 ```
 
-If the database already exists and `~/.hermes/.env` already contains
-`PG_MEM_DB_CONN_STR`, install only the plugin files:
+If `~/.hermes/.env` already contains `PG_MEM_DB_CONN_STR`, install only the
+plugin files:
 
 ```bash
 ./install.sh
@@ -53,8 +70,10 @@ Restart Hermes after changing `.env` or `config.yaml`.
 
 ## Database schema
 
-Run `plugins/memory/postgres/sql/000_schema.sql` against the database in
-`PG_MEM_DB_CONN_STR`.
+After DB prerequisites pass, run `plugins/memory/postgres/sql/000_schema.sql`
+against the database in `PG_MEM_DB_CONN_STR`. This schema step uses the
+non-superuser runtime role; if it fails with permission errors, the DBA
+prerequisites were not completed.
 
 The greenfield schema creates:
 
@@ -124,5 +143,6 @@ plugins/memory/postgres/scripts/uninstall.sh --db --yes
 plugins/memory/postgres/scripts/uninstall.sh --all --yes
 ```
 
-The database step drops plugin tables. It does not remove the PostgreSQL role,
-database, or `vector` extension unless explicitly requested.
+The database step drops plugin tables through the runtime role. Dropping the
+PostgreSQL role, database, or `vector` extension is a DBA operation outside the
+agent-side lifecycle.

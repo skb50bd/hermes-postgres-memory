@@ -6,6 +6,7 @@ set -uo pipefail
 
 HERMES_HOME="${HERMES_HOME:-$HOME/.hermes/hermes-agent}"
 JSON=0
+EXPLICIT_PG_MEM_DB_CONN_STR="${PG_MEM_DB_CONN_STR:-}"
 while [ $# -gt 0 ]; do
     case "$1" in
         --hermes-home) HERMES_HOME="$2"; shift 2 ;;
@@ -25,7 +26,7 @@ CHECKS:
   - hermes-agent checkout/plugin path
   - ~/.hermes/.env and PG_MEM_DB_CONN_STR
   - psql / pg_isready / psycopg2
-  - PostgreSQL reachability, pgvector, schema ownership
+  - PostgreSQL reachability, non-superuser runtime role, pgvector, schema ownership
   - fresh schema tables, per-dim vector columns, model registry, HNSW indexes
 EOF
             exit 0 ;;
@@ -51,6 +52,7 @@ if [ -f "$ENV_FILE" ]; then
     # shellcheck disable=SC1090
     . "$ENV_FILE"
     set +a
+    [ -n "$EXPLICIT_PG_MEM_DB_CONN_STR" ] && PG_MEM_DB_CONN_STR="$EXPLICIT_PG_MEM_DB_CONN_STR"
 fi
 
 PASS=0
@@ -103,7 +105,7 @@ else:
     if {'host','dbname','user','password'} <= pairs.keys():
         port = ':' + pairs['port'] if pairs.get('port') else ''
         ssl = '?sslmode=' + q(pairs['sslmode']) if pairs.get('sslmode') else ''
-        print(f"postgresql://{q(pairs['user'])}:{q(pairs['password'])}@{pairs['host']}{port}/{q(pairs['dbname'])}{ssl}")
+        print('postgresql://' + q(pairs['user']) + ':' + q(pairs['password']) + '@' + pairs['host'] + port + '/' + q(pairs['dbname']) + ssl)
     else:
         print(raw)
 PY
@@ -144,10 +146,22 @@ if [ -n "$PG_MEM_DB_CONN_STR" ] && [ -n "$PGISREADY_BIN" ]; then
 fi
 
 if [ -n "$PG_MEM_DB_CONN_STR" ] && [ -n "$PSQL_BIN" ]; then
+    CAN_CONNECT=0
     if run_psql "SELECT 1;" >/dev/null; then
         ok "role can connect" "PG_MEM_DB_CONN_STR works"
+        CAN_CONNECT=1
     else
         fail "role can connect" "psql failed via PG_MEM_DB_CONN_STR"
+    fi
+fi
+
+if [ -n "$PG_MEM_DB_CONN_STR" ] && [ -n "$PSQL_BIN" ] && [ "${CAN_CONNECT:-0}" = "1" ]; then
+    CURRENT_USER="$(run_psql "SELECT current_user;" | tr -d ' ' || true)"
+    IS_SUPER="$(run_psql "SELECT rolsuper FROM pg_roles WHERE rolname = current_user;" | tr -d ' ' || true)"
+    if [ "$IS_SUPER" = "t" ]; then
+        fail "runtime role is non-superuser" "PG_MEM_DB_CONN_STR points at a superuser; use the dedicated app role"
+    else
+        ok "runtime role is non-superuser" "$CURRENT_USER"
     fi
 
     if [ "$(run_psql "SELECT 1 FROM pg_extension WHERE extname='vector';" | tr -d ' ')" = "1" ]; then
@@ -157,7 +171,6 @@ if [ -n "$PG_MEM_DB_CONN_STR" ] && [ -n "$PSQL_BIN" ]; then
     fi
 
     PUB_OWNER="$(run_psql "SELECT pg_catalog.pg_get_userbyid(n.nspowner) FROM pg_namespace n WHERE n.nspname='public';" | tr -d ' ' || true)"
-    CURRENT_USER="$(run_psql "SELECT current_user;" | tr -d ' ' || true)"
     if [ -n "$PUB_OWNER" ] && [ "$PUB_OWNER" = "$CURRENT_USER" ]; then
         ok "public schema owner" "$PUB_OWNER"
     else

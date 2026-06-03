@@ -1,0 +1,16 @@
+[tool.pytest.ini_options]
+# Lock the test runner for this repo. The active venv is shared with
+# ~/.hermes/hermes-agent/ which has its own addopts
+# (`-m 'not integration' --timeout=30 --timeout-method=signal`) and
+# a testpaths entry that would otherwise bleed in and either skip
+# tests marked `integration` here, or surface a timeout that doesn't
+# match the repo's actual latency profile. Clearing addopts keeps the
+# hermes-agent config from contaminating this repo's test runs.
+addopts = ""
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+# No markers defined here on purpose — this repo doesn't ship an
+# `integration` marker and inheriting hermes-agent's `-m 'not integration'`
+# would silently filter tests that happen to have unrelated marker
+# strings in their docstrings. If a future test file needs a marker,
+# declare it here.

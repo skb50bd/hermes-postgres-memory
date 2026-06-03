@@ -70,32 +70,74 @@ class TestRootManifest:
         )
 
     def test_root_name_matches_repo(self):
-        """The root manifest name should reflect the repo identity so
-        users see something recognizable in `hermes plugins list`."""
+        """The root manifest's name should match the repo's directory
+        name (or the GitHub repo basename) — not a hardcoded string.
+        If the repo is ever renamed, the manifest should be renamed
+        too; this test catches drift by reading the actual repo name
+        from disk rather than asserting a literal."""
         root = _load_yaml(ROOT_PLUGIN_YAML)
-        assert root["name"] == "hermes-postgres-memory", (
-            f"Unexpected root name {root['name']!r}; expected "
-            f"'hermes-postgres-memory' to match the repo"
+        # The repo identity is the directory name. This is what users
+        # see in `hermes plugins list` and what shows up in GitHub URLs.
+        repo_name = REPO_ROOT.name
+        # The root manifest name should be either the repo name itself
+        # or the inner-plugin's name with a prefix (e.g. 'pg-mem'
+        # for a repo called 'pg-mem'). The simplest invariant: it
+        # must be a non-empty string with no spaces or slashes, and
+        # it should not be the inner plugin's name (which would
+        # collide at runtime).
+        inner = _load_yaml(INNER_PLUGIN_YAML)
+        name = root["name"]
+        assert name, "Root manifest name must be non-empty"
+        assert " " not in name, f"Root name {name!r} must not contain spaces"
+        assert "/" not in name, f"Root name {name!r} must not contain slashes"
+        assert name != inner["name"], (
+            f"Root name {name!r} collides with inner plugin name "
+            f"{inner['name']!r}"
+        )
+        # Soft check: the repo name should appear somewhere in the
+        # manifest name. This catches silent renames where the repo
+        # moved but the manifest stayed the same.
+        assert repo_name.replace("-", "") in name.replace("-", ""), (
+            f"Root name {name!r} doesn't reflect the repo name "
+            f"{repo_name!r}; if you renamed the repo, update the "
+            f"manifest (or vice versa)"
         )
 
     def test_root_manifest_propagates_env_requirements(self):
-        """The inner plugin requires PG_MEM_DB_CONN_STR. The root
-        manifest must declare the same so the installer's
-        `_missing_requires_env_names` check (which reads the root
-        manifest, not the inner one) warns the user before they hit
-        runtime errors."""
+        """The root manifest must declare the SAME set of requires_env as
+        the inner plugin. The installer's `_missing_requires_env_names`
+        check reads the root manifest (not the inner one) and warns the
+        user before they hit runtime errors. A subset is acceptable
+        ONLY if the inner is empty; otherwise the root must match
+        exactly — anything less means the user is missing a
+        pre-flight warning."""
         root = _load_yaml(ROOT_PLUGIN_YAML)
-        assert "PG_MEM_DB_CONN_STR" in (root.get("requires_env") or []), (
-            "Root manifest must declare requires_env: [PG_MEM_DB_CONN_STR] "
-            "to match the inner plugin's runtime requirement"
+        inner = _load_yaml(INNER_PLUGIN_YAML)
+        root_env = set(root.get("requires_env") or [])
+        inner_env = set(inner.get("requires_env") or [])
+        assert root_env == inner_env, (
+            f"Root requires_env {sorted(root_env)!r} drifts from inner "
+            f"{sorted(inner_env)!r}; the installer's pre-flight check "
+            f"reads the root manifest, so a missing var there means a "
+            f"missing warning to the user"
         )
 
     def test_root_manifest_propagates_pip_dependencies(self):
+        """Same contract for pip_dependencies as for requires_env: the
+        root must match the inner exactly, and the inner must declare
+        at least one dep so a missing dep is caught."""
         root = _load_yaml(ROOT_PLUGIN_YAML)
         inner = _load_yaml(INNER_PLUGIN_YAML)
-        assert root.get("pip_dependencies") == inner.get("pip_dependencies"), (
-            f"Root pip_dependencies {root.get('pip_dependencies')!r} "
-            f"drifts from inner {inner.get('pip_dependencies')!r}"
+        root_deps = list(root.get("pip_dependencies") or [])
+        inner_deps = list(inner.get("pip_dependencies") or [])
+        assert root_deps == inner_deps, (
+            f"Root pip_dependencies {root_deps!r} "
+            f"drifts from inner {inner_deps!r}"
+        )
+        assert inner_deps, (
+            "Inner manifest must declare at least one pip_dependencies "
+            "entry; a plugin with no declared deps would silently import "
+            "missing packages at runtime"
         )
 
     def test_version_is_semver(self):
@@ -132,15 +174,24 @@ class TestInstallShContract:
     def test_install_sh_still_present(self):
         assert (REPO_ROOT / "install.sh").exists()
 
-    def test_install_sh_unchanged(self):
-        """install.sh has its own copy logic and doesn't depend on the
-        root manifest. Pin that we haven't accidentally coupled it."""
+    def test_install_sh_targets_inner_plugin_path(self):
+        """install.sh must continue to copy the inner
+        plugins/memory/postgres/ directory — not the new root manifest.
+        The root plugin.yaml is install-time metadata only; the runtime
+        loads from the inner __init__.py. If install.sh ever starts
+        reading the root manifest, it would diverge from the runtime
+        discovery path."""
         script = (REPO_ROOT / "install.sh").read_text()
         assert "PLUGIN_SRC=" in script, "install.sh PLUGIN_SRC variable missing"
         assert "plugins/memory/postgres" in script, (
-            "install.sh should still reference the inner plugin path"
+            "install.sh should reference the inner plugin path"
         )
-        # install.sh should NOT try to read the root manifest
-        assert "plugin.yaml" not in script or "PLUGIN_SRC" in script, (
-            "install.sh appears to depend on plugin.yaml at the wrong path"
+        # install.sh must not depend on the root manifest — the install
+        # path uses the inner plugin's own plugin.yaml, not the new
+        # top-level one.
+        assert "plugin.yaml" not in script, (
+            "install.sh appears to read plugin.yaml; the inner plugin "
+            "has its own plugin.yaml at plugins/memory/postgres/, and "
+            "the new root manifest is for `hermes plugins install` only. "
+            "install.sh should not depend on either."
         )

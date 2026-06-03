@@ -20,6 +20,19 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HERMES_HOME="${HERMES_HOME:-$HOME/.hermes/hermes-agent}"
 
+# Auto-resolve HERMES_HOME: see plugins/memory/postgres/scripts/diagnose.sh
+# for the full rationale. The agent runtime exports HERMES_HOME as the
+# parent (/home/u/.hermes), but install.sh expects the checkout
+# (/home/u/.hermes/hermes-agent). Resolve the mismatch once, here.
+if [ -d "$HERMES_HOME" ]; then
+    if [ ! -f "$HERMES_HOME/run_agent.py" ] && [ ! -f "$HERMES_HOME/AGENTS.md" ] && [ -d "$HERMES_HOME/hermes-agent" ]; then
+        HERMES_HOME="$HERMES_HOME/hermes-agent"
+    fi
+fi
+if [ ! -d "$HERMES_HOME" ] && [ -d "$HERMES_HOME/hermes-agent" ]; then
+    HERMES_HOME="$HERMES_HOME/hermes-agent"
+fi
+
 PLUGIN_SRC="$SCRIPT_DIR/plugins/memory/postgres"
 PLUGIN_DST="$HERMES_HOME/plugins/memory/postgres"
 

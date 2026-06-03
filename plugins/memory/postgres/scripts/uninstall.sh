@@ -21,9 +21,26 @@
 set -uo pipefail
 
 HERMES_HOME="${HERMES_HOME:-$HOME/.hermes/hermes-agent}"
+
+# Auto-resolve HERMES_HOME: see plugins/memory/postgres/scripts/diagnose.sh
+# for the full rationale. The agent runtime exports HERMES_HOME as the
+# parent (/home/u/.hermes), but uninstall.sh expects the checkout
+# (/home/u/.hermes/hermes-agent). Resolve the mismatch once, here.
+if [ -d "$HERMES_HOME" ]; then
+    if [ ! -f "$HERMES_HOME/run_agent.py" ] && [ ! -f "$HERMES_HOME/AGENTS.md" ] && [ -d "$HERMES_HOME/hermes-agent" ]; then
+        HERMES_HOME="$HERMES_HOME/hermes-agent"
+    fi
+fi
+if [ ! -d "$HERMES_HOME" ] && [ -d "$HERMES_HOME/hermes-agent" ]; then
+    HERMES_HOME="$HERMES_HOME/hermes-agent"
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PLUGIN_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-REPO_DIR="$(cd "$PLUGIN_DIR/../.." && pwd)"
+# Layout: scripts/ → postgres/ → memory/ → plugins/ → <repo root>.
+# Go up 3 from PLUGIN_DIR. Currently unused by uninstall.sh itself, but
+# kept for symmetry with bootstrap.sh and any future cross-repo logic.
+REPO_DIR="$(cd "$PLUGIN_DIR/../../.." && pwd)"
 
 DO_PLUGIN=0; DO_DB=0; DO_ALL=0; DO_ROLE=0; DO_DATABASE=0
 ASSUME_YES=0

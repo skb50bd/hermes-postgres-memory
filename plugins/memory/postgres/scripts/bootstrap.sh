@@ -51,7 +51,9 @@ done
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PLUGIN_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-REPO_DIR="$(cd "$PLUGIN_DIR/../.." && pwd)"
+# Layout: scripts/ → postgres/ → memory/ → plugins/ → <repo root>.
+# So we go up 4 levels from SCRIPT_DIR (or equivalently 3 from PLUGIN_DIR).
+REPO_DIR="$(cd "$PLUGIN_DIR/../../.." && pwd)"
 
 # ─── color helpers (auto-disable if no tty) ─────────────────────────────
 
@@ -413,6 +415,6 @@ ${BOLD}${GREEN}═════════════════════�
        pg_remember(content="postgres plugin is live", category="fact")
        pg_search(query="postgres plugin")
 
-  ${BOLD}${DIM}if anything looks off, re-run:${RESET} ${BOLD}./diagnose.sh${RESET}
+  ${BOLD}${DIM}if anything looks off, re-run:${RESET} ${BOLD}$SCRIPT_DIR/diagnose.sh${RESET}
 
 EOF

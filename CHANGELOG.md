@@ -1,5 +1,42 @@
 # Changelog
 
+## 1.3.1 (2026-06-03)
+
+### Fixed
+- **`diagnose.sh` HERMES_HOME resolution**: the script now auto-resolves
+  `HERMES_HOME` from the parent (`/home/u/.hermes`, which the agent
+  runtime exports) to the checkout (`/home/u/.hermes/hermes-agent`).
+  Detection uses the presence of `run_agent.py` or `AGENTS.md` at the
+  resolved path. The script used to report a false-positive
+  "not a hermes-agent checkout" failure when the env var pointed at the
+  parent. Also accepts both the old flat `plugins/memory/` layout and
+  the current nested `plugins/memory/postgres/` layout.
+- **`bootstrap.sh` REPO_DIR math**: was resolving to
+  `plugins/memory/` instead of the repo root (off by one `..` after
+  the repo restructured to `plugins/memory/postgres/`). Fixed to
+  `cd "$PLUGIN_DIR/../../.."` and annotated. Symptom was a silent
+  failure to find `$REPO_DIR/install.sh` (the file existed; the path
+  just didn't).
+- **`install.sh` HERMES_HOME resolution**: now matches `diagnose.sh` —
+  accepts the parent-dir export and walks down to the checkout. Same
+  detection heuristic.
+- **`uninstall.sh` HERMES_HOME + REPO_DIR**: same auto-resolve + same
+  REPO_DIR math fix as the other two scripts, for consistency.
+- **`diagnose.sh` next-steps hint**: the "ready to install" footer
+  used to print a bare `./install.sh` (relative to cwd, so useless if
+  the user ran diagnose from elsewhere). Now resolves to an absolute
+  path: `$SCRIPT_DIR/../../../../install.sh` walked through `pwd -P`.
+- **`bootstrap.sh` re-run hint**: the "if anything looks off, re-run"
+  footer used to print `./diagnose.sh`. Now prints the absolute path
+  via `$SCRIPT_DIR/diagnose.sh`.
+
+### Live verification
+- `HERMES_HOME=/home/u/.hermes` (parent): **17/17** ✓
+- `HERMES_HOME=/home/u/.hermes/hermes-agent` (explicit): **17/17** ✓
+- `HERMES_HOME` unset (default): **17/17** ✓
+- `HERMES_HOME=/nonexistent`: **16/17** (fails the `HERMES_HOME exists`
+  check correctly — no false positive).
+
 ## 1.3.0 (2026-06-XX)
 
 ### Major changes

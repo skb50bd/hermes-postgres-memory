@@ -57,6 +57,35 @@ EOF
     esac
 done
 
+# Auto-resolve HERMES_HOME: the production layout is ~/.hermes (parent)
+# with the checkout at ~/.hermes/hermes-agent. Three cases the caller
+# might trip over:
+#   (a) HERMES_HOME unset or empty — fall through to the default, which
+#       already points at the checkout.
+#   (b) HERMES_HOME set to the parent (/home/u/.hermes) — the agent
+#       runtime exports it this way, and ./diagnose.sh needs to find
+#       the checkout one level down.
+#   (c) HERMES_HOME set to a path that simply doesn't exist — try the
+#       <HERMES_HOME>/hermes-agent and <HERMES_HOME>/.hermes/hermes-agent
+#       fallbacks before giving up.
+#
+# Resolution: if HERMES_HOME looks like the parent (no run_agent.py or
+# AGENTS.md at the top level, but one nested at /hermes-agent), point
+# at the nested one. AGENTS.md is the dev-guide sentinel; run_agent.py
+# is the runtime entry point — either is a strong signal it's the
+# checkout, not a parent dir.
+if [ -d "$HERMES_HOME" ]; then
+    if [ ! -f "$HERMES_HOME/run_agent.py" ] && [ ! -f "$HERMES_HOME/AGENTS.md" ] && [ -d "$HERMES_HOME/hermes-agent" ]; then
+        HERMES_HOME="$HERMES_HOME/hermes-agent"
+    fi
+fi
+if [ ! -d "$HERMES_HOME" ] && [ -d "$HERMES_HOME/hermes-agent" ]; then
+    HERMES_HOME="$HERMES_HOME/hermes-agent"
+fi
+if [ ! -d "$HERMES_HOME" ] && [ -d "$HERMES_HOME/.hermes/hermes-agent" ]; then
+    HERMES_HOME="$HERMES_HOME/.hermes/hermes-agent"
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Load .env if present so we can pick up POSTGRES_* without the user
@@ -92,7 +121,10 @@ check_psycopg2() {
 # ─── 1-2. hermes-agent checkout ────────────────────────────────────────
 
 if [ -d "$HERMES_HOME" ]; then
-    if [ -d "$HERMES_HOME/plugins/memory" ]; then
+    # Accept both the old flat layout (plugins/memory/) and the current
+    # nested layout (plugins/memory/postgres/) — a hermes-agent install
+    # of the postgres memory provider leaves one of the two on disk.
+    if [ -d "$HERMES_HOME/plugins/memory/postgres" ] || [ -d "$HERMES_HOME/plugins/memory" ]; then
         ok "hermes-agent checkout" "found at $HERMES_HOME"
     else
         fail "plugins/memory/ exists" "missing in $HERMES_HOME — not a hermes-agent checkout?"
@@ -309,13 +341,19 @@ else
     if [ $FAIL -gt 0 ]; then
         echo "  one or more checks failed. common fixes:"
         echo "  • install psql + pg_isready:    apt install postgresql-client"
-        echo "  • bootstrap the database:        ./scripts/bootstrap.sh"
+        echo "  • bootstrap the database:        $SCRIPT_DIR/bootstrap.sh"
         echo "  • or run by hand:                psql -U postgres -f sql/000_create_database_and_role.sql"
-        echo "  • re-run this script after each fix: ./scripts/diagnose.sh"
+        echo "  • re-run this script after each fix: $SCRIPT_DIR/diagnose.sh"
         echo
     else
         echo "  ready to install. next:"
-        echo "  • ./install.sh                   # install plugin + skill into HERMES_HOME"
+        # install.sh lives at the repo root, which is 4 levels up from
+        # this script (plugins/memory/postgres/scripts/diagnose.sh).
+        # Resolve to an absolute path so the next-steps hint is readable
+        # regardless of where the user ran diagnose.sh from.
+        INSTALL_SH="$(cd "$SCRIPT_DIR/../../../../" && pwd)/install.sh"
+        echo "  • $INSTALL_SH"
+        echo "      # install plugin + skill into HERMES_HOME"
         echo "  • hermes gateway restart         # pick up the new .env + plugin"
         echo "  • hermes postgres-memory preflight   # confirm the plugin sees the DB"
         echo

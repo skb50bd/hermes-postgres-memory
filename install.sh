@@ -38,8 +38,14 @@ fi
 PLUGIN_SRC="$SCRIPT_DIR/plugins/memory/postgres"
 PLUGIN_DST="$HERMES_HOME/plugins/memory/postgres"
 
+KANBAN_SRC="$SCRIPT_DIR/plugins/kanban/postgres"
+KANBAN_DST="$HERMES_HOME/plugins/kanban/postgres"
+
 SKILL_SRC="$SCRIPT_DIR/skills/devops/hermes-postgres-memory"
 SKILL_DST="$HERMES_HOME/skills/devops/hermes-postgres-memory"
+
+KANBAN_SKILL_SRC="$SCRIPT_DIR/skills/devops/hermes-postgres-kanban"
+KANBAN_SKILL_DST="$HERMES_HOME/skills/devops/hermes-postgres-kanban"
 
 DIAGNOSE_ONLY=0
 ASSUME_YES=0
@@ -111,9 +117,22 @@ echo "→ Installing plugin to $PLUGIN_DST"
 mkdir -p "$PLUGIN_DST"
 cp -R "$PLUGIN_SRC/." "$PLUGIN_DST/"
 
+# Kanban plugin (PG-backed replacement for the old SQLite boards)
+if [ -d "$KANBAN_SRC" ]; then
+    echo "→ Installing kanban plugin to $KANBAN_DST"
+    mkdir -p "$KANBAN_DST"
+    cp -R "$KANBAN_SRC/." "$KANBAN_DST/"
+fi
+
 echo "→ Installing skill to $SKILL_DST"
 mkdir -p "$SKILL_DST"
 cp -R "$SKILL_SRC/." "$SKILL_DST/"
+
+if [ -d "$KANBAN_SKILL_SRC" ]; then
+    echo "→ Installing kanban skill to $KANBAN_SKILL_DST"
+    mkdir -p "$KANBAN_SKILL_DST"
+    cp -R "$KANBAN_SKILL_SRC/." "$KANBAN_SKILL_DST/"
+fi
 
 # ─── done ───────────────────────────────────────────────────────────────
 

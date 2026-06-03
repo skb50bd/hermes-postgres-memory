@@ -1,0 +1,9 @@
+name: hermes-postgres-kanban
+version: 0.1.0
+description: "PostgreSQL-backed kanban storage for Hermes Agent — replaces the SQLite boards at ~/.hermes/kanban/boards/*/kanban.db with the hermes_kanban schema. SKIP LOCKED claim, FTS, hierarchical tenants, race-free dispatcher."
+author: "Shakib Haris"
+license: "MIT"
+pip_dependencies:
+  - psycopg2-binary
+requires_env:
+  - PG_MEM_DB_CONN_STR
